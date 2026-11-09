@@ -1,0 +1,4 @@
+- insert:
+    - id: pdd-ego-listing
+      # 可被 loader import 的包名或路径；装进 dsh profile 后按包名加载。
+      name: "dsh-plugin-pdd-ego"

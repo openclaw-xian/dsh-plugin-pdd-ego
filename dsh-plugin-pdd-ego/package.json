@@ -1,0 +1,32 @@
+{
+  "name": "dsh-plugin-pdd-ego",
+  "version": "1.0.0",
+  "private": true,
+  "description": "DeepSeek Harness 插件：ego 版拼多多多店铺上架入口（技能 pdd-ego-listing + 工具 pdd_ego_*）。只填空与校验，绝不提交。",
+  "license": "MIT",
+  "type": "module",
+  "main": "lib/index.mjs",
+  "exports": {
+    ".": {
+      "default": "./lib/index.mjs"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "skill",
+    "cordis.patch.yml",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/schemastery": "*"
+  }
+}
