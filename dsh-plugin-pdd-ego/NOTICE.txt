@@ -1,0 +1,11 @@
+dsh-plugin-pdd-ego 1.1.8
+=======================
+
+Source: NovaFlow 本地维护的插件（本仓库 apps/desktop/third-party 中随包分发），无第三方上游仓库。
+License: MIT（见本包 README.md 与仓库 LICENSE）。
+
+随包改动：
+- 执行层（cli-ego / pdd_flow_ego / run_listing_ego / tools）随包放在 scripts/，不再依赖仓库外的外部工作目录。
+- ego-browser、Python、日志路径改为「插件配置 > 环境变量 > 自动探测」。
+- 只填空与 34 项 validateForm 校验，默认不存草稿、不提交；提交需要 allowSubmit 与 submitAfterPass 同时开启。
+- 运行时依赖：ego-browser、带 openpyxl 的 Python 3、已登录的拼多多商家后台；缺失时工具返回可操作的错误文案，不影响宿主启动。

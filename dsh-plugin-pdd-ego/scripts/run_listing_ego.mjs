@@ -4,27 +4,49 @@
 // ★上架前必须先问用户：店铺、素材包、运费模板（默认模板 or 指定）、是否存草稿、是否允许提交。
 import { readFile } from "node:fs/promises";
 import { existsSync, readdirSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import {
   log, sleep, connectShop, dismissOverlays, detectCategoryPage, openManualCategoryPicker, searchCategory,
-  goNextToForm, uploadMainImages, fillTitle, uploadZoneFast, readDetailZone, fillBrand,
+  gotoUrl, clickText,
+  goNextToForm, uploadMainImages, waitMainUploads, waitCategoryPickerReady, fillTitle, uploadZoneFast, readDetailZone, fillBrand,
   applyAttributesByCandidates, fillDirectAttrs, ensureSpecTable, fillSkuRowsAndVerify,
   uploadMissingPreviews, countPreviewCells, setRefPrice, validateForm, readImageCounters, uploadVideo, uploadWhiteBg,
   packagingLabelState, mainImagesState, clearZone, readAllSkuRows, makeStickyMapRow, getScrollMeta,
   checkDuplicate, validateSpecValues, repairSpecMatrix, cleanExtraDetails, openPublishPage, pathSuffixMatch,
   validateListingPayload, commitSpecTail, probeRequiredAttributes, fillSkuRowsCDP, evalLong,
   setFreightTemplate, listFreightTemplates, readFreightTemplate, shotPage,
-  submitProduct, verifyListed,
+  submitProduct, verifyListed, waitUntil,
 } from "./pdd_flow_ego.mjs";
 import { mkdirSync } from "node:fs";
 
-// 配置优先读 D:/egoscripts/run-config.json（便于多轮批量测试）
-let CFG = { spaceId: 2, product: "D:/assets/GE-格栅吸音-店1-链2/work/product.json", saveDraft: true };
+// 配置来源，优先级从高到低：
+//   1) 内联 globalThis.__PDD_CFG（插件把它塞进 -e 脚本，可按次覆盖字段）
+//   2) 环境变量 PDD_CONFIG 指向的 JSON
+//   3) 与脚本同目录的 run-config.json
+const INLINE = (typeof globalThis !== "undefined" && globalThis.__PDD_CFG) || {};
+const CONFIG_PATH = String(
+  INLINE.configPath || process.env.PDD_CONFIG || fileURLToPath(new URL("./run-config.json", import.meta.url))
+);
+let CFG = {
+  spaceId: null, product: "", saveDraft: false, skipDup: true, freightTemplate: "",
+  submitAfterPass: false, allowSubmit: false, shot: false,
+};
 try {
-  const raw = (await readFile("D:/egoscripts/run-config.json", "utf8")).replace(/^\uFEFF/, "");
+  const raw = (await readFile(CONFIG_PATH, "utf8")).replace(/^\uFEFF/, "");
   CFG = { ...CFG, ...JSON.parse(raw) };
-} catch (e) {}
+} catch (e) {
+  console.log("[上架] 读配置失败：" + CONFIG_PATH + " — " + String((e && e.message) || e).slice(0, 160));
+}
+// 内联参数覆盖配置文件，便于一次一跑
+for (const k of ["spaceId", "product", "saveDraft", "skipDup", "freightTemplate", "submitAfterPass", "allowSubmit", "shot"]) {
+  if (INLINE[k] !== undefined && INLINE[k] !== null && INLINE[k] !== "") CFG[k] = INLINE[k];
+}
 const SPACE_ID = CFG.spaceId;
-const PRODUCT = CFG.product;
+const PRODUCT = String(CFG.product || "").trim();
+if (!PRODUCT) {
+  console.log("[上架] 缺少 product：在 " + CONFIG_PATH + " 里填写，或通过插件参数传入");
+  throw new Error("product_required:" + CONFIG_PATH);
+}
 const SAVE_DRAFT = CFG.saveDraft === true; // 只有显式 saveDraft:true 才存草稿（默认不存）
 
 // ── 按素材包自动解析白底图 / 视频（找不到就跳过，不再写死路径）──
@@ -32,7 +54,7 @@ function resolveAssets(productPath) {
   const workDir = String(productPath).replace(/\\/g, "/").replace(/\/work\/product\.json$/, "");
   const base = workDir.split("/").pop() || "";
   const stripped = base.replace(/^[A-Za-z0-9]+-/, "");
-  const ROOTS = ["D:/assets/", "D:/assets/", "D:/图片/"];
+  const ROOTS = Array.isArray(CFG.assetRoots) ? CFG.assetRoots.map(String) : [];
   let packName = stripped, packDir = null;
   for (const root of ROOTS) {
     for (const c of [base, stripped]) {
@@ -41,7 +63,7 @@ function resolveAssets(productPath) {
     }
     if (packDir) break;
   }
-  if (!packDir) packDir = ROOTS[0] + stripped;
+  if (!packDir) packDir = workDir; // 未配置 assetRoots 时就在素材包自身目录里找
   const out = { packName, packDir, exists: existsSync(packDir), whiteBg: null, video: null };
   if (!out.exists) return out;
   const walk = (dir, depth) => {
@@ -147,7 +169,11 @@ try {
   if (onForm) {
     console.log("[上架]", stamp(), "②b 已在表单 → 直接重开类目页重跑（不点修改分类）");
     await gotoUrl(page, "https://mms.pinduoduo.com/goods/category");
-    await sleep(4500);
+    await waitUntil(async () => {
+      const k = await detectCategoryPage(page).catch(() => null);
+      const onFormNow = String((k && k.evidence || {}).url || "").includes("goods_add");
+      return k && (onFormNow || k.kind !== "unknown") ? k : null;
+    }, { timeoutMs: 15000, intervalMs: 400, label: "category-reopen" });
     kind = await detectCategoryPage(page);
     onForm = String((kind.evidence || {}).url || "").includes("goods_add");
     console.log("[上架]", stamp(), "① 类目页(重开) =", kind.kind);
@@ -166,11 +192,17 @@ try {
     const scOld = await searchCategory(page, P.category, { confirm: true });
     console.log("[上架]", stamp(), "② 旧版-类目 =", JSON.stringify(scOld).slice(0, 200));
     if (!scOld.ok) throw new Error("category_failed_old:" + scOld.reason);
-    await sleep(2500);
+    await waitUntil(
+      () => page.evaluate(() => [...document.querySelectorAll("button")].some((b) => b.offsetParent && /下一步/.test(b.innerText || ""))),
+      { timeoutMs: 10000, intervalMs: 300, label: "next-button" },
+    );
     const hasNext = await page.evaluate(() => [...document.querySelectorAll("button")].some((b) => b.offsetParent && /下一步/.test(b.innerText || "")));
     if (hasNext) {
       await clickText(page, "下一步", { exact: false, timeoutMs: 15000 }).catch(() => {});
-      await sleep(6000);
+      await waitUntil(
+        () => page.evaluate(() => (document.body.innerText || "").includes("商品轮播图")),
+        { timeoutMs: 20000, intervalMs: 400, label: "form-after-next" },
+      );
     }
     const up2 = await uploadZoneFast(page, "商品轮播图", 10, D.main_images.slice(0, 10), { timeoutMs: 240000 });
     console.log("[上架]", stamp(), "③ 旧版-主图 =", JSON.stringify(up2));
@@ -180,18 +212,34 @@ try {
     console.log("[上架]", stamp(), "③ 旧版-URL =", urlOld.slice(0, 100));
     if (!urlOld.includes("goods_add")) throw new Error("not_on_form_old");
   } else {
-    // ② 新版页：主图 + 标题 → 手动选类目 → 下一步
-    const mu = await uploadMainImages(page, D.main_images, { capacity: 10 });
-    console.log("[上架]", stamp(), "② 主图 =", JSON.stringify(mu));
+    // ② 新版页：**先发起主图上传（不 await）** → 立刻填标题 → 直接点"手动选择商品分类"（不等推荐卡） → 下一步前收上传
+    const t0 = Date.now();
+    const uploadPromise = uploadMainImages(page, D.main_images, { capacity: 10, fireAndGo: true });
     const ti = await fillTitle(page, P.title);
-    console.log("[上架]", stamp(), "② 标题 =", JSON.stringify(ti));
-    const om = await openManualCategoryPicker(page);
+    console.log("[上架]", stamp(), "② 标题 =", JSON.stringify(ti), "| 距发起上传", ((Date.now() - t0) / 1000).toFixed(1) + "s");
+    // 不要盲等推荐卡：直接点「手动选择商品分类」（内部会"找不到就点查看更多推荐"再轮询）
+    let om = await openManualCategoryPicker(page);
     console.log("[上架]", stamp(), "② 手动选类目入口 =", JSON.stringify(om));
+    let mu = null;
+    if (!om.ok) {
+      // 入口还没渲染时，最常见的原因是主图还在处理：先收上传，再重试一次入口（有依据地等，而不是干等）
+      mu = await uploadPromise;
+      console.log("[上架]", stamp(), "② 主图 =", JSON.stringify(mu), "| 上传总耗时", ((Date.now() - t0) / 1000).toFixed(1) + "s");
+      om = await openManualCategoryPicker(page);
+      console.log("[上架]", stamp(), "② 手动选类目入口(重试) =", JSON.stringify(om));
+    }
+    if (!om.ok) throw new Error("category_picker_not_found:" + JSON.stringify(om).slice(0, 160));
     const sc = await searchCategory(page, P.category, { confirm: true });
     console.log("[上架]", stamp(), "② 类目 =", JSON.stringify(sc));
     if (!sc.ok) throw new Error("category_failed");
+    // 类目确认后**立刻点下一步**（不为等图而停顿；实测不等上传也能进表单，主图最终由 ④a/⑩ 校验）
     const nx = await goNextToForm(page);
     console.log("[上架]", stamp(), "② 进表单 =", JSON.stringify(nx).slice(0, 220));
+    if (mu === null) {
+      mu = await uploadPromise;
+      console.log("[上架]", stamp(), "② 主图 =", JSON.stringify(mu), "| 上传总耗时", ((Date.now() - t0) / 1000).toFixed(1) + "s");
+    }
+    if (!mu.ok) throw new Error("main_upload_failed:" + JSON.stringify(mu).slice(0, 160));
   await shot("② 表单");
     if (!nx.ok) throw new Error("not_on_form");
     const catNow = nx.category || nx.categoryRaw || "";
@@ -350,8 +398,12 @@ try {
   await shot("⑩ 终校验");
   for (const c of vf.checks) console.log("     [" + (c.status === "pass" ? "pass" : "FAIL") + "] " + c.name + ": " + String(c.value).slice(0, 64));
 
-  // ⑪ 可选提交（仅在用户当轮明确授权；CFG.submitAfterPass === true 才执行）
-  if (CFG.submitAfterPass === true) {
+  // ⑪ 可选提交：两个开关都要显式打开——allowSubmit（插件层授权）与 submitAfterPass（本次运行授权）
+  const ALLOW_SUBMIT = CFG.allowSubmit === true;
+  if (CFG.submitAfterPass === true && !ALLOW_SUBMIT) {
+    console.log("[上架]", stamp(), "⑪ 已跳过提交：submitAfterPass=true 但 allowSubmit 未开启");
+  }
+  if (CFG.submitAfterPass === true && ALLOW_SUBMIT) {
     if (!vf.allPass) throw new Error("submit_blocked_validation_failed");
     console.log("[上架]", stamp(), "⑪ 提交授权已确认（allPass=true）→ 点「提交并上架」");
     const sub = await submitProduct(page, vf);

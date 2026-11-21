@@ -1,0 +1,12 @@
+{
+  "_note": "复制为 run-config.json 后填真实值；不要把含真实路径的 run-config.json 提交进仓库。",
+  "spaceId": 1,
+  "product": "",
+  "saveDraft": false,
+  "skipDup": true,
+  "freightTemplate": "__ASK__",
+  "submitAfterPass": false,
+  "allowSubmit": false,
+  "shot": false,
+  "video": ""
+}

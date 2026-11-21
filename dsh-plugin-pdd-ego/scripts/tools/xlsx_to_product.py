@@ -4,7 +4,7 @@
 xlsx_to_product.py —— 素材包一键生成 product.json（read_excel + build_product 的胶水）
 
 用法：
-  python xlsx_to_product.py --assets "D:/assets/竹节加厚-店1-链1" \
+  python xlsx_to_product.py --assets "<素材包根目录>" \
                             --out    "<包目录>/work" \
                             [--attrs-from "<参考 product.json>"] \
                             [--title "..."] [--brand 祺讯] [--ref 128]
@@ -106,10 +106,13 @@ def main():
             'preview': pv_path.replace('\\', '/'),
         })
 
-    attrs = {}
+    # 默认直接按 Excel 的产品属性列取（不依赖参考包）；--attrs-from 只用于覆盖同名项
+    attrs = d.get('attributes') or {}
     if a.attrs_from and os.path.isfile(a.attrs_from):
         ref = json.load(open(a.attrs_from, encoding='utf-8-sig'))
-        attrs = (ref.get('product') or {}).get('attributes') or {}
+        ref_attrs = (ref.get('product') or {}).get('attributes') or {}
+        if ref_attrs:
+            attrs = {**attrs, **ref_attrs}
 
     listing = {
         'category': prod.get('category') or d.get('category'),

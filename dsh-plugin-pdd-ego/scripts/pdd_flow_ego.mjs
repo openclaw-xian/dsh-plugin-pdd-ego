@@ -35,6 +35,23 @@ export async function gotoUrl(page, url) {
 
 export const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+/**
+ * 轮询到条件为真再继续，替代固定 sleep。
+ *
+ * `check` 返回真值即视为完成（返回值会带回来）；超时返回 ok:false 与最后一次结果，
+ * 由调用方决定是报错还是降级，避免"白等固定秒数"。
+ */
+export async function waitUntil(check, { timeoutMs = 30000, intervalMs = 250, label = "" } = {}) {
+  const started = Date.now();
+  let value = null;
+  while (Date.now() - started < timeoutMs) {
+    value = await check().catch(() => null);
+    if (value) return { ok: true, waitedMs: Date.now() - started, value, label };
+    await sleep(intervalMs);
+  }
+  return { ok: false, waitedMs: Date.now() - started, value: null, label };
+}
+
 /** 页面上是否出现某段文本 */
 export async function hasText(page, text) {
   return page.evaluate((t) => (document.body.innerText || "").replace(/\s+/g, " ").includes(t), text);
@@ -163,11 +180,17 @@ export async function openManualCategoryPicker(page, { timeoutMs = 25000 } = {})
       return { ok: false, how: "nothing_to_click" };
     });
     if (r.ok) {
-      if (r.how === "clicked") await sleep(3500);
+      // 等「选择分类」弹窗真正出来（搜索框可见）再继续，而不是固定等 3.5s
+      if (r.how === "clicked") {
+        await waitUntil(
+          () => page.evaluate(() => !!document.querySelector('input[placeholder*="关键词搜索分类"]')),
+          { timeoutMs: 8000, intervalMs: 250, label: "category-picker-open" },
+        );
+      }
       return r;
     }
     last = r;
-    await sleep(2000);
+    await sleep(800);
   }
   return last;
 }
@@ -263,13 +286,20 @@ export async function searchCategory(page, categoryText, { keyword = "", timeout
     return true;
   }, target);
   if (!clicked) return { ok: false, reason: "click_failed", seen };
-  await sleep(1800);
-
-  const readback = await page.evaluate(() => {
+  // 页面上可能残留上一轮的选择，所以必须等到「已选分类」**与目标匹配**才算选中，
+  // 不能只等这段文本出现。
+  const readCategory = () => page.evaluate(() => {
     const t = document.body.innerText || "";
     const m = t.match(/已选分类\s*([^\n]{0,80})/);
     return m ? m[1].replace(/\s+/g, " ").trim() : null;
   });
+  const readbackWait = await waitUntil(async () => {
+    const raw = await readCategory();
+    if (!raw) return null;
+    const normalized = raw.replace(/\s*>\s*/g, " > ").trim();
+    return pathSuffixMatch(normalized, target) ? raw : null;
+  }, { timeoutMs: 8000, intervalMs: 250, label: "category-selected" });
+  const readback = readbackWait.value || await readCategory();
   const chosenNorm = readback ? readback.replace(/\s*>\s*/g, " > ").trim() : null;
   if (!pathSuffixMatch(chosenNorm, target)) return { ok: false, reason: "selected_mismatch", chosen: chosenNorm, seen };
 
@@ -323,13 +353,33 @@ export async function goNextToForm(page, { timeoutMs = 30000 } = {}) {
     });
     last = ready;
     if (ready.onForm && ready.hasCarousel && ready.hasModify) return { ok: true, clicked, ...ready };
-    await sleep(1000);
+    await sleep(500);
   }
   return { ok: false, clicked, ...(last || {}) };
 }
 
-/** 主图上传（新版页：第一个可见 file input；旧版页：逐个图片 input 试 + 主图计数验证） */
-export async function uploadMainImages(page, files, { capacity = 10, timeoutMs = 180000 } = {}) {
+/** 等类目推荐卡 / 手动入口 / 「查看更多推荐」出现（有的店铺要等主图处理完才渲染推荐卡） */
+export async function waitCategoryPickerReady(page, { timeoutMs = 60000, intervalMs = 400 } = {}) {
+  const wait = await waitUntil(
+    () => page.evaluate(() => {
+      const vis = (e) => !!(e && e.offsetParent);
+      const norm = (s) => (s || "").replace(/\s+/g, " ").trim();
+      const hasCards = document.querySelectorAll('[class*="cateItemCard"], [class*="chooseCategory"]').length > 0;
+      const hasMore = [...document.querySelectorAll("*")].some((e) => vis(e) && /查看更多推荐/.test(e.innerText || ""));
+      const hasManual = [...document.querySelectorAll("button")].some((e) => vis(e) && norm(e.innerText).startsWith("手动选择"));
+      return hasCards || hasMore || hasManual ? { hasCards, hasMore, hasManual } : null;
+    }),
+    { timeoutMs, intervalMs, label: "category-picker-ready" },
+  );
+  return { ok: !!wait.value, waitedMs: wait.waitedMs, ...(wait.value || {}) };
+}
+
+/** 主图上传（新版页：第一个可见 file input；旧版页：逐个图片 input 试 + 主图计数验证）
+ *
+ * `fireAndGo: true` 时只负责把文件按顺序发出去（每张仅等一个很短的受理窗口），
+ * 立刻返回，让调用方先去填标题/选类目；完成度由 `waitMainUploads` 在真正需要时再等。
+ */
+export async function uploadMainImages(page, files, { capacity = 10, timeoutMs = 180000, fireAndGo = false } = {}) {
   const n = Math.min(files.length, capacity);
   const marker = "ego-main-" + Date.now();
   const sel = await page.evaluate((mkv) => {
@@ -340,8 +390,32 @@ export async function uploadMainImages(page, files, { capacity = 10, timeoutMs =
   }, marker);
 
   if (sel) {
-    // ★主图必须逐张上传：一次性塞 n 张会让平台并发上传、完成顺序不定 → 轮播图顺序随机（首图错位的根因）
+    // 主图两个模式：
+    //  - 默认：逐张上传并逐张确认（顺序最稳，但每张要等平台处理完）
+    //  - fireAndGo：先试**一次 setInputFiles 传整组**（与 pdd-product-listing 同做法）；
+    //    但必须先看到计数真的增长才算下发成功，否则回退逐张 —— 吞掉错误会造成"报告已下发、其实一张没传"。
     const want = files.slice(0, n);
+    if (fireAndGo) {
+      const counterUp = async () => {
+        const c = await readImageCounters(page).catch(() => []);
+        return (c.find((x) => x.total === capacity) || c[0] || {}).up || 0;
+      };
+      let batchAccepted = false;
+      let batchError = null;
+      try {
+        await page.setInputFiles(sel, want);
+        const grew = await waitUntil(async () => {
+          const up = await counterUp();
+          return up > 0 ? up : null;
+        }, { timeoutMs: 6000, intervalMs: 300, label: "main-batch-accepted" });
+        batchAccepted = !!grew.value;
+      } catch (e) {
+        batchError = String(e && e.message || e).slice(0, 200);
+        log("② 主图整组下发失败，回退逐张：", batchError);
+      }
+      if (batchAccepted) return { ok: true, how: "batch_once", fired: want.length };
+      log("② 主图整组下发未被接受（计数仍为 0），回退逐张上传");
+    }
     for (const f of want) {
       const before = await readImageCounters(page)
         .then((c) => ((c.find((x) => x.total === capacity) || c[0] || {}).up || 0))
@@ -350,7 +424,7 @@ export async function uploadMainImages(page, files, { capacity = 10, timeoutMs =
       const dl = Date.now() + 30000;
       let grew = false;
       while (Date.now() < dl) {
-        await sleep(900);
+        await sleep(350);
         const c = await readImageCounters(page).catch(() => []);
         const nowUp = (c.find((x) => x.total === capacity) || c[0] || {}).up || 0;
         const thumbs = await page
@@ -362,16 +436,19 @@ export async function uploadMainImages(page, files, { capacity = 10, timeoutMs =
         }
       }
       if (!grew) {
-        await sleep(1500);
         await page.setInputFiles(sel, [f]).catch(() => {});
-        await sleep(6000);
+        await waitUntil(async () => {
+          const c = await readImageCounters(page).catch(() => []);
+          const nowUp = (c.find((x) => x.total === capacity) || c[0] || {}).up || 0;
+          return nowUp > before ? nowUp : null;
+        }, { timeoutMs: 20000, intervalMs: 250, label: "main-retry" });
       }
-      await sleep(1100);
     }
+    if (fireAndGo) return { ok: true, how: "fire_and_go", fired: want.length };
     const deadline = Date.now() + timeoutMs;
     let last = null;
     while (Date.now() < deadline) {
-      await sleep(1200);
+      await sleep(400);
       const thumb = await page.evaluate(() => {
         const norm = (x) => (x || "").replace(/\s+/g, " ").trim();
         const imgs = [...document.querySelectorAll("img")].filter((i) => i.offsetParent && /pddpic|pfs\\.pinduoduo/.test(i.src || "")).length;
@@ -415,6 +492,19 @@ export async function uploadMainImages(page, files, { capacity = 10, timeoutMs =
   return { ok: false, reason: "main_upload_failed", state: await mainImagesState(page).catch(() => null) };
 }
 
+/** 等主图上传真正完成（配合 uploadMainImages 的 fireAndGo：先发出去，需要时再等） */
+export async function waitMainUploads(page, expect, { timeoutMs = 120000, intervalMs = 300 } = {}) {
+  const wait = await waitUntil(async () => {
+    const counters = await readImageCounters(page).catch(() => []);
+    const up = (counters.find((x) => x.total === expect) || counters[0] || {}).up || 0;
+    const thumbs = await page
+      .evaluate(() => [...document.querySelectorAll("img")].filter((i) => i.offsetParent && /pddpic|pfs\.pinduoduo/.test(i.src || "")).length)
+      .catch(() => 0);
+    return up >= expect || thumbs >= expect ? { up, thumbs } : null;
+  }, { timeoutMs, intervalMs, label: "main-uploads" });
+  return { ok: !!wait.value, waitedMs: wait.waitedMs, ...(wait.value || {}) };
+}
+
 /** 填标题（聚焦 → 输入 → 失焦，读回校验） */
 export async function fillTitle(page, title) {
   const sel = 'input[placeholder*="商品标题"]';
@@ -424,17 +514,23 @@ export async function fillTitle(page, title) {
   await page.keyboard.press("Control+a").catch(() => {});
   await page.keyboard.press("Backspace").catch(() => {});
   await page.keyboard.insertText(String(title));
-  await sleep(300);
   await page.evaluate(() => {
     const a = document.activeElement;
     if (a && typeof a.blur === "function") a.blur();
   });
-  await clickText(page, "商品标题", { exact: false, timeoutMs: 3000 }).catch(() => {});
-  await sleep(1200);
-  const back = await page.evaluate(() => {
-    const i = [...document.querySelectorAll("input")].find((x) => /商品标题/.test(x.placeholder || ""));
-    return i ? i.value : null;
-  });
+  // 触发推荐类目卡靠的是 blur（点空白只是另一种失焦手段，找不到"商品标题"时反而白等 3s）
+  const readWait = await waitUntil(
+    () => page.evaluate((want) => {
+      const i = [...document.querySelectorAll("input")].find((x) => /商品标题/.test(x.placeholder || ""));
+      return i && i.value === want ? i.value : null;
+    }, String(title)),
+    { timeoutMs: 3000, intervalMs: 200, label: "title-readback" },
+  );
+  const back = readWait.value
+    || await page.evaluate(() => {
+      const i = [...document.querySelectorAll("input")].find((x) => /商品标题/.test(x.placeholder || ""));
+      return i ? i.value : null;
+    });
   return { ok: back === String(title), value: back };
 }
 
@@ -505,7 +601,7 @@ export async function uploadZoneFast(page, zoneName, capacity, files, { timeoutM
         const deadline = Date.now() + 26000;
         let okNow = false;
         while (Date.now() < deadline) {
-          await sleep(700);
+          await sleep(350);
           const z = await readDetailZone(page).catch(() => null);
           if (!z || (z.containers || 0) <= baseCnt) continue;
           const realNow = await page
@@ -526,15 +622,17 @@ export async function uploadZoneFast(page, zoneName, capacity, files, { timeoutM
         if (okNow) {
           done = true;
           okCount += 1;
-          await sleep(1100); // 放慢节奏，降低平台侧偶发失败
         } else {
           // 失败：删掉刚产生的占位，再重试同一张（此时后续图还没传，顺序不会错）
           retries += 1;
           const z2 = await readDetailZone(page).catch(() => null);
           if (z2 && (z2.containers || 0) > baseCnt) {
             await deleteDetailAt(page, (z2.containers || 1) - 1).catch(() => null);
+            await waitUntil(async () => {
+              const z3 = await readDetailZone(page).catch(() => null);
+              return z3 && (z3.containers || 0) <= baseCnt ? z3 : null;
+            }, { timeoutMs: 8000, intervalMs: 300, label: "detail-delete-settled" });
           }
-          await sleep(2400);
         }
       }
       if (!done) failedImgs.push(String(f).split("/").pop());
@@ -710,28 +808,47 @@ export async function readDetailZone(page) {
   });
 }
 
-/** 品牌输入（搜索 + 选中选项 + 读回） */
+/** 品牌输入（点开下拉 → 找现成选项 → 找不到才打字过滤 → 读回） */
 export async function fillBrand(page, brand) {
   const has = await clickSelector(page, 'input[placeholder*="品牌名称"]');
   if (!has) return { ok: false, reason: "no_brand_input" };
-  await sleep(200);
-  await page.keyboard.insertText(String(brand));
-  await sleep(2200);
-  const pos = await page.evaluate((b) => {
+  const findOption = (b) => page.evaluate((want) => {
     const norm = (s) => (s || "").replace(/\s+/g, " ").trim();
-    const els = [...document.querySelectorAll("*")].filter((el) => el.offsetParent && norm(el.textContent) === b);
+    // 先精确匹配，再退一步取「包含该品牌名」的短选项（有的店铺品牌写作「祺讯(授权)」）
+    let els = [...document.querySelectorAll("*")].filter((el) => el.offsetParent && norm(el.textContent) === want);
+    if (!els.length) {
+      els = [...document.querySelectorAll("*")].filter((el) => {
+        if (!el.offsetParent) return false;
+        const txt = norm(el.textContent);
+        return txt.length <= want.length + 12 && txt.includes(want) && !/立即体验|换背景/.test(txt);
+      });
+    }
     if (!els.length) return null;
     const el = els[els.length - 1];
     el.scrollIntoView({ block: "center" });
     const r = el.getBoundingClientRect();
     return { x: Math.round(r.x + r.width / 2), y: Math.round(r.y + r.height / 2) };
-  }, brand);
+  }, String(brand));
+
+  // 先点开下拉看现成选项（实测有的店铺品牌列表直接展开，输入反而把候选过滤没了）
+  let pos = (await waitUntil(() => findOption(brand), { timeoutMs: 3500, intervalMs: 200, label: "brand-open" })).value;
+  if (!pos) {
+    await page.keyboard.insertText(String(brand));
+    pos = (await waitUntil(() => findOption(brand), { timeoutMs: 6000, intervalMs: 250, label: "brand-typed" })).value;
+  }
   if (pos) await page.mouse.click(pos.x, pos.y, { label: "choose brand" });
-  await sleep(1200);
-  const back = await page.evaluate(() => {
-    const i = [...document.querySelectorAll("input")].find((x) => /品牌名称/.test(x.placeholder || ""));
-    return i ? i.value : null;
-  });
+  const readbackWait = await waitUntil(
+    () => page.evaluate((b) => {
+      const i = [...document.querySelectorAll("input")].find((x) => /品牌名称/.test(x.placeholder || ""));
+      return i && i.value === b ? i.value : null;
+    }, String(brand)),
+    { timeoutMs: 6000, intervalMs: 250, label: "brand-readback" },
+  );
+  const back = readbackWait.value
+    || await page.evaluate(() => {
+      const i = [...document.querySelectorAll("input")].find((x) => /品牌名称/.test(x.placeholder || ""));
+      return i ? i.value : null;
+    });
   return { ok: back === String(brand), value: back };
 }
 
@@ -779,40 +896,142 @@ export async function applyAttributesByCandidates(page, attrs) {
       }, label);
       if (!pos) { lastGot = null; break; }
       await page.mouse.click(pos.x, pos.y, { label: "open " + label });
-      await sleep(800);
+      // 等下拉真正出选项，而不是固定等 0.8s
+      await waitUntil(
+        () => page.evaluate((val) => {
+          const norm = (s) => (s || "").replace(/\s+/g, " ").trim();
+          return [...document.querySelectorAll("*")].some(
+            (el) => el.offsetParent && norm(el.textContent) === norm(val) && !/立即体验|换背景/.test(norm(el.textContent))
+          );
+        }, value),
+        { timeoutMs: 4000, intervalMs: 200, label: "attr-options" },
+      );
       await dismissOverlays(page);
 
-      clicked = await page.evaluate((val) => {
+      // 用真实鼠标点击选项（DOM .click() 对部分下拉不触发 React 选择，实测会出现"读回有值、字段仍空"）
+      const optionPos = await page.evaluate((val) => {
         const norm = (s) => (s || "").replace(/\s+/g, " ").trim();
         const els = [...document.querySelectorAll("*")].filter(
           (el) => el.offsetParent && norm(el.textContent) === norm(val) && !/立即体验|换背景/.test(norm(el.textContent))
         );
-        if (!els.length) return { ok: false };
-        els[els.length - 1].click();
-        return { ok: true, how: "direct" };
-      }, value);
+        if (!els.length) return null;
+        const el = els[els.length - 1];
+        el.scrollIntoView({ block: "center" });
+        const r = el.getBoundingClientRect();
+        return { x: Math.round(r.x + r.width / 2), y: Math.round(r.y + r.height / 2) };
+      }, value).catch(() => null);
+      clicked = optionPos ? { ok: true, how: "direct" } : { ok: false };
+      if (optionPos) await page.mouse.click(optionPos.x, optionPos.y, { label: "pick " + label });
       if (clicked.ok) how = clicked.how;
 
       if (!clicked.ok) {
-        await page.keyboard.insertText(value).catch(() => {});
-        await sleep(1300);
-        clicked = await page.evaluate((val) => {
-          const norm = (s) => (s || "").replace(/\s+/g, " ").trim();
+        // 只认「刚打开的那个下拉」：取可见面板里**文字最少**的那个（当前属性的选项列表通常很短），
+        // 取最大的会点到别的、更早打开的下拉（实测会出现「普通商品/非二手」这类无关项）。
+        // 真实鼠标点击（DOM .click() 对部分下拉不触发 React 选择）
+        const clickExactInPanel = async (val) => {
+          const p = await page.evaluate((v) => {
+            const norm = (s) => (s || "").replace(/\s+/g, " ").trim();
+            const panels = [...document.querySelectorAll("[class*=dropdownPanel], [class*=dropdownMain], [class*=PP_outerWrapper]")]
+              .filter((e) => e.offsetParent && !/立即体验|换背景/.test(e.innerText || ""))
+              .sort((a, b) => (a.innerText || "").length - (b.innerText || "").length);
+            const scope = panels[0];
+            if (!scope) return null;
+            const els = [...scope.querySelectorAll("*")].filter((el) => el.offsetParent && norm(el.textContent) === norm(v));
+            if (!els.length) return null;
+            const el = els[els.length - 1];
+            el.scrollIntoView({ block: "center" });
+            const r = el.getBoundingClientRect();
+            return { x: Math.round(r.x + r.width / 2), y: Math.round(r.y + r.height / 2) };
+          }, val).catch(() => null);
+          if (!p) return { ok: false };
+          await page.mouse.click(p.x, p.y, { label: "pick attr option" });
+          return { ok: true, how: "exact" };
+        };
+        const scrollPanel = () => page.evaluate(() => {
           const panels = [...document.querySelectorAll("[class*=dropdownPanel], [class*=dropdownMain], [class*=PP_outerWrapper]")]
-            .filter((e) => e.offsetParent && !/立即体验|换背景/.test(e.innerText || ""));
-          const scope = panels.sort((a, b) => (b.innerText || "").length - (a.innerText || "").length)[0] || document.body;
-          const els = [...scope.querySelectorAll("*")].filter((el) => el.offsetParent && norm(el.textContent) === norm(val));
-          if (!els.length) return { ok: false };
-          els[els.length - 1].click();
-          return { ok: true, how: "typed_filter" };
-        }, value);
+            .filter((e) => e.offsetParent && !/立即体验|换背景/.test(e.innerText || ""))
+            .sort((a, b) => (a.innerText || "").length - (b.innerText || "").length);
+          const scope = panels[0];
+          if (!scope) return false;
+          const lists = [scope, ...scope.querySelectorAll("*")]
+            .filter((e) => e.scrollHeight > e.clientHeight + 20 && e.clientHeight > 60);
+          const list = lists.sort((a, b) => b.clientHeight - a.clientHeight)[0];
+          if (!list) return false;
+          list.scrollTop += Math.max(120, list.clientHeight - 40);
+          return true;
+        });
+
+        // 第一步：**不打字**，直接在展开的下拉里滚动查找（全串搜索常被过滤成「搜索无结果」）
+        for (let round = 0; round < 12 && !clicked.ok; round += 1) {
+          clicked = await clickExactInPanel(value);
+          if (clicked.ok) break;
+          const moved = await scrollPanel();
+          if (!moved) break;
+          await sleep(220);
+        }
+
+        if (!clicked.ok) {
+          // 第二步：退到短关键词（括号前那段）再滚动，覆盖虚拟列表很长的情况
+          const keyword = String(value).split(/[（(【\[]/)[0].trim() || String(value);
+          await page.keyboard.press("Control+a").catch(() => {});
+          await page.keyboard.press("Backspace").catch(() => {});
+          await page.keyboard.insertText(keyword).catch(() => {});
+          await sleep(600);
+          for (let round = 0; round < 10 && !clicked.ok; round += 1) {
+            clicked = await clickExactInPanel(value);
+            if (clicked.ok) break;
+            const moved = await scrollPanel();
+            if (!moved) break;
+            await sleep(250);
+          }
+        }
         if (clicked.ok) how = clicked.how;
       }
-      await sleep(900);
-
       if (clicked.ok) {
-        lastGot = await readAttr(page, label);
+        // 等页面把选中值写回，而不是固定等 0.9s
+        const readBackOnce = async (timeoutMs = 3000) => {
+          const w = await waitUntil(async () => {
+            const got = await readAttr(page, label).catch(() => null);
+            return got && got.includes(value) ? got : null;
+          }, { timeoutMs, intervalMs: 250, label: "attr-readback" });
+          return w.value || await readAttr(page, label).catch(() => null);
+        };
+        lastGot = await readBackOnce();
         ok = (lastGot || "").includes(value);
+        // 不同字段接受的点击方式不同（实测同一页上有的只认真实鼠标点击、有的只认 DOM click）：
+        // 真实点击无效时依次退到 DOM click、键盘输入+Enter，再判定失败。
+        if (!ok) {
+          const domOk = await page.evaluate((v) => {
+            const norm = (s) => (s || "").replace(/\s+/g, " ").trim();
+            const panels = [...document.querySelectorAll("[class*=dropdownPanel], [class*=dropdownMain], [class*=PP_outerWrapper]")]
+              .filter((e) => e.offsetParent && !/立即体验|换背景/.test(e.innerText || ""))
+              .sort((a, b) => (a.innerText || "").length - (b.innerText || "").length);
+            const scope = panels[0] || document.body;
+            const els = [...scope.querySelectorAll("*")].filter((el) => el.offsetParent && norm(el.textContent) === norm(v));
+            if (!els.length) return false;
+            els[els.length - 1].click();
+            return true;
+          }, value).catch(() => false);
+          if (domOk) {
+            how = "dom_click";
+            lastGot = await readBackOnce(2000);
+            ok = (lastGot || "").includes(value);
+          }
+          if (!ok) {
+            await page.keyboard.insertText(String(value)).catch(() => {});
+            await sleep(400);
+            await page.keyboard.press("Enter").catch(() => {});
+            how = "keyboard";
+            lastGot = await readBackOnce(2500);
+            ok = (lastGot || "").includes(value);
+          }
+        }
+        if (!ok) {
+          // 三种点法都无效：**不再重复点击**（多选字段再点一次会把刚选的值取消掉），记 needReview 交人工。
+          how = "readback_mismatch";
+          lastGot = await readAttr(page, label).catch(() => lastGot);
+          break;
+        }
       } else {
         ok = false;
         lastGot = null;
@@ -881,16 +1100,24 @@ export async function openPublishPage(task, page, { timeoutMs = 60000 } = {}) {
         url: location.href,
         hasMain: t.includes("商品主图"),
         hasNext: t.includes("下一步"),
+        // 发品页真正的标志：商品标题输入框；只有"商品主图/下一步"字样可能是商家后台别的页面
+        hasTitle: !!document.querySelector('input[placeholder*="商品标题"]'),
+        hasFile: document.querySelectorAll("input[type=file]").length > 0,
+        // 更硬的判据：轮播图分区文案。后台首页/帮助页没有它，误判会被它挡住
+        hasCarouselText: t.includes("商品轮播图") || t.includes("上传图片 ("),
         hasSearch: !!document.querySelector('input[placeholder*="关键词搜索分类"]'),
         bodyLen: t.length,
       };
-    }).catch(() => ({ url: "", hasMain: false, hasNext: false, hasSearch: false, bodyLen: 0 }));
+    }).catch(() => ({ url: "", hasMain: false, hasNext: false, hasTitle: false, hasFile: false, hasSearch: false, bodyLen: 0 }));
 
   await gotoUrl(page, "https://mms.pinduoduo.com/goods/category");
-  await sleep(3500);
-  let st = await readyCheck(page);
+  const readyWait = await waitUntil(async () => {
+    const s = await readyCheck(page);
+    return (s.hasCarouselText || s.hasSearch || String(s.url || "").includes("goods_add")) ? s : null;
+  }, { timeoutMs: 12000, intervalMs: 300, label: "publish-page-ready" });
+  let st = readyWait.value || await readyCheck(page);
   if (String(st.url || "").includes("goods_add")) return { task, page, how: "already_on_form", state: st };
-  if (st.hasMain || st.hasNext || st.hasSearch) return { task, page, how: "direct", state: st };
+  if (st.hasCarouselText || st.hasSearch || st.hasFile && st.hasCarouselText) return { task, page, how: "direct", state: st };
 
   await gotoUrl(page, LIST_URL);
   await sleep(5000);
@@ -1132,7 +1359,7 @@ export async function uploadWhiteBg(page, file, { timeoutMs = 180000 } = {}) {
       await page.setInputFiles(sel, [file]).catch(() => {});
       const dl = Date.now() + 45000;
       while (Date.now() < dl) {
-        await sleep(1800);
+        await sleep(500);
         const st = await readCell();
         if (st.hasThumb) return { ok: true, how: "direct_input", state: st };
       }
@@ -3667,7 +3894,7 @@ export async function shotPage(page, dir, name, opts = {}) {
   if (!page || typeof page.screenshot !== "function") return { ok: false, reason: "no_page" };
   const stamp = new Date().toISOString().replace(/[-:T]/g, "").slice(0, 15);
   const safe = String(name || "shot").replace(/[\\/:*?"<>|\s]+/g, "_").slice(0, 60);
-  const outDir = String(dir || "D:/egoscripts/shots");
+  const outDir = String(dir || "shots");
   const file = `${outDir}/${stamp}_${safe}.png`;
   try {
     await page.screenshot({ path: file, fullPage });

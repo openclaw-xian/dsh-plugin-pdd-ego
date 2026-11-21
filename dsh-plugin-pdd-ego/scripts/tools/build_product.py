@@ -153,7 +153,7 @@ def main():
     # 2026-10-05：旧实现硬编码默认 True，与 config.json 的 false 相反，属「静默放行重复编码」。
     skill_cfg = {}
     try:
-        skill_cfg = json.load(open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json"), encoding="utf-8"))
+        skill_cfg = json.load(open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.json"), encoding="utf-8-sig"))
     except Exception:
         skill_cfg = {}
     allow_dup = cfg.get("allow_duplicate_codes", skill_cfg.get("allow_duplicate_codes", False))
