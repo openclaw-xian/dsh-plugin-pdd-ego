@@ -8,5 +8,8 @@
   "submitAfterPass": false,
   "allowSubmit": false,
   "shot": false,
+  "detailMode": "strict",
+  "builtinDecisions": {},
+  "builtinAsk": "",
   "video": ""
 }

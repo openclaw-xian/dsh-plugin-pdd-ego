@@ -535,7 +535,7 @@ export async function fillTitle(page, title) {
 }
 
 /** 图区上传（逐张 + 逐张核对计数） */
-export async function uploadZoneFast(page, zoneName, capacity, files, { timeoutMs = 300000, waitMs = 60000 } = {}) {
+export async function uploadZoneFast(page, zoneName, capacity, files, { timeoutMs = 300000, waitMs = 60000, detailMode = "strict" } = {}) {
   const marker = "ego-zone-" + Date.now();
   const sel = await page.evaluate(
     ({ zone, mkv }) => {
@@ -588,7 +588,7 @@ export async function uploadZoneFast(page, zoneName, capacity, files, { timeoutM
   const list = files.slice(0, want);
 
   // ── 详情区：逐张严格上传（计数器会把失败占位也算进 N/50，所以必须核对真实 pfs 图）──
-  if (isDetail) {
+  if (isDetail && detailMode !== "batch") {
     const failedImgs = [];
     let okCount = 0;
     let retries = 0;
@@ -626,8 +626,10 @@ export async function uploadZoneFast(page, zoneName, capacity, files, { timeoutM
           // 失败：删掉刚产生的占位，再重试同一张（此时后续图还没传，顺序不会错）
           retries += 1;
           const z2 = await readDetailZone(page).catch(() => null);
+          // ★ 只有「确实新增了容器」时才删，且只删 baseCnt 这一格；
+          //   容器没增加（上传没生效/延迟）时**什么都不要删**——否则会删掉上一张已成功的图
           if (z2 && (z2.containers || 0) > baseCnt) {
-            await deleteDetailAt(page, (z2.containers || 1) - 1).catch(() => null);
+            await deleteDetailAt(page, baseCnt).catch(() => null);
             await waitUntil(async () => {
               const z3 = await readDetailZone(page).catch(() => null);
               return z3 && (z3.containers || 0) <= baseCnt ? z3 : null;
@@ -639,7 +641,7 @@ export async function uploadZoneFast(page, zoneName, capacity, files, { timeoutM
     }
     const fin = await readDetailZone(page).catch(() => null);
     return {
-      ok: failedImgs.length === 0 && okCount === want,
+      ok: failedImgs.length === 0 && okCount === want && (fin ? fin.realImgs || 0 : 0) === want,
       uploaded: fin ? fin.containers : null,
       want,
       okCount,
@@ -650,6 +652,35 @@ export async function uploadZoneFast(page, zoneName, capacity, files, { timeoutM
       containers: fin ? fin.containers : null,
       zone: zoneName,
       how: "detail_strict",
+    };
+  }
+
+  // ── 详情区：批量上传（detailMode="batch"）；快，但失败不会自动重传，只用 realImgs 兜底判定 ──
+  if (isDetail && detailMode === "batch") {
+    await page.setInputFiles(sel, list).catch(() => {});
+    await waitUntil(
+      async () => {
+        const z = await readDetailZone(page).catch(() => null);
+        if (!z || (z.containers || 0) < want) return null;
+        return z;
+      },
+      { timeoutMs: Math.round(timeoutMs * 0.6), intervalMs: 600, label: "detail-batch" },
+    );
+    await sleep(3500);
+    const fin = await readDetailZone(page).catch(() => null);
+    const real = fin ? fin.realImgs || 0 : 0;
+    return {
+      ok: real >= want && (fin ? (fin.failed || 0) === 0 : false),
+      uploaded: fin ? fin.containers : null,
+      want,
+      okCount: real,
+      failedImgs: [],
+      failedCount: Math.max(0, want - real),
+      retries: 0,
+      realImgs: fin ? fin.realImgs : null,
+      containers: fin ? fin.containers : null,
+      zone: zoneName,
+      how: "detail_batch",
     };
   }
 
@@ -896,6 +927,12 @@ export async function applyAttributesByCandidates(page, attrs) {
       }, label);
       if (!pos) { lastGot = null; break; }
       await page.mouse.click(pos.x, pos.y, { label: "open " + label });
+      // 首次按原逻辑选；若失败（长列表类目如「适用场景」），第 2 次起先输入关键字过滤
+      if (attempt > 1) {
+        await sleep(500);
+        await page.keyboard.insertText(String(value).slice(0, 4)).catch(() => {});
+        await sleep(900);
+      }
       // 等下拉真正出选项，而不是固定等 0.8s
       await waitUntil(
         () => page.evaluate((val) => {
@@ -1050,7 +1087,22 @@ export async function applyAttributesByCandidates(page, attrs) {
           }
         }, label).catch(() => {});
       }
-      if (!ok) { await page.keyboard.press("Escape").catch(() => {}); await sleep(500); }
+      // 无论成败都关掉下拉：否则下一个属性点击会命中上一个属性残留的面板（实测「适用场景」因此取到「功能特点」的选项）
+      await page.keyboard.press("Escape").catch(() => {});
+      await sleep(400);
+      // 点「商品标题」标签左上角的空白处关闭下拉（不要点页面顶部：会命中品牌下拉并误选）
+      {
+        const p = await page.evaluate(() => {
+          const norm = (s) => (s || "").replace(/\s+/g, " ").trim();
+          const el = [...document.querySelectorAll("*")].find((e) => e.offsetParent && !e.children.length && /商品标题/.test(norm(e.textContent)));
+          if (!el) return null;
+          el.scrollIntoView({ block: "center" });
+          const r = el.getBoundingClientRect();
+          return { x: Math.round(r.x + 2), y: Math.round(r.y + 2) };
+        }).catch(() => null);
+        if (p) await page.mouse.click(p.x, p.y, { label: "close dropdown safely" }).catch(() => {});
+      }
+      await sleep(300);
     }
 
     const r = { label, value, got: lastGot, ok, how: ok ? how : "failed" };
@@ -1060,6 +1112,72 @@ export async function applyAttributesByCandidates(page, attrs) {
     log("⑤ 属性 " + label + " =", JSON.stringify(r));
   }
   return { ok: needReview.length === 0, results, needReview };
+}
+
+/** 满件折扣（满N件 X 折）：定位 label → 同行数字输入 → 写值 → 回读 */
+export async function fillFullDiscount(page, value = 9.9, { pieces = 2 } = {}) {
+  const found = await page
+    .evaluate(() => {
+      const norm = (s) => (s || "").replace(/\s+/g, " ").trim();
+      const vis = (e) => !!(e && e.offsetParent);
+      // label 可能是「*满件折扣 ?」这种带星号/图标的节点（不是纯叶子）→ 取包含关键词的最短元素
+      const lab = [...document.querySelectorAll("*")]
+        .filter((e) => vis(e) && /满件折扣/.test(norm(e.textContent)))
+        .sort((a, b) => norm(a.textContent).length - norm(b.textContent).length)[0];
+      if (!lab) return null;
+      let row = lab;
+      for (let i = 0; i < 6 && row; i++) {
+        row = row.parentElement;
+        if (!row) break;
+        const ins = [...row.querySelectorAll("input")].filter(vis).filter((x) => x.type === "text" || x.type === "number");
+        if (!ins.length) continue;
+        const t = ins.find((x) => !/请选择/.test(x.placeholder || "")) || ins[0];
+        t.setAttribute("data-ego", "fullDisc");   // 打下标记，读回时按标记取（不依赖 label 可见性）
+        t.scrollIntoView({ block: "center" });
+        const r = t.getBoundingClientRect();
+        return { x: Math.round(r.x + r.width / 2), y: Math.round(r.y + r.height / 2), cur: t.value };
+      }
+      return null;
+    })
+    .catch(() => null);
+  if (!found) return { ok: false, reason: "label_not_found" };
+
+  if (String(found.cur) === String(value)) return { ok: true, already: true, value: found.cur };
+
+  await page.mouse.click(found.x, found.y, { label: "full discount" });
+  await new Promise((r) => setTimeout(r, 300));
+  await page.keyboard.press("Control+a").catch(() => {});
+  await page.keyboard.press("Backspace").catch(() => {});
+  await page.keyboard.insertText(String(value));
+  await new Promise((r) => setTimeout(r, 500));
+  await page.keyboard.press("Tab").catch(() => {});
+  await new Promise((r) => setTimeout(r, 800));
+
+  const got = await page
+    .evaluate(() => {
+      const norm = (s) => (s || "").replace(/\s+/g, " ").trim();
+      const vis = (e) => !!(e && e.offsetParent);
+      // label 可能是「*满件折扣 ?」这种带星号/图标的节点（不是纯叶子）→ 取包含关键词的最短元素
+      const lab = [...document.querySelectorAll("*")]
+        .filter((e) => vis(e) && /满件折扣/.test(norm(e.textContent)))
+        .sort((a, b) => norm(a.textContent).length - norm(b.textContent).length)[0];
+      // ① 优先按标记读（写入时的那个 input，最可靠）
+      const marked = document.querySelector('input[data-ego="fullDisc"]');
+      if (marked) return marked.value;
+      // ② 兜底：按 label 找（这里**不做可见性过滤**，Tab 之后页面可能已滚动）
+      if (!lab) return null;
+      let row = lab;
+      for (let i = 0; i < 6 && row; i++) {
+        row = row.parentElement;
+        if (!row) break;
+        const ins = [...row.querySelectorAll("input")].filter((x) => x.type === "text" || x.type === "number");
+        if (!ins.length) continue;
+        return ins[0].value;
+      }
+      return null;
+    })
+    .catch(() => null);
+  return { ok: String(got) === String(value), value: got, want: String(value) };
 }
 
 /** 数字直填属性（厚度等）：定位 label 的 form-item → input 写值 */
@@ -1369,12 +1487,18 @@ export async function uploadWhiteBg(page, file, { timeoutMs = 180000 } = {}) {
 }
 
 /** 连店：接管 ego space（若归用户所有则 takeOver），返回 {task, page} */
-export async function connectShop(spaceId) {
+export async function connectShop(spaceId, { allowTakeOver = true } = {}) {
   let task;
   try {
     task = await claimTaskSpace(spaceId);
   } catch (e) {
-    // ownership=user 的 space 不能直接 claim，需要 takeOver
+    // ownership=user 的 space 不能直接 claim：默认 takeOver；allowTakeOver=false 时**不抢**，直接报给用户
+    if (!allowTakeOver) {
+      throw new Error(
+        "space_in_use_by_user(请点浏览器右下角『交还给 Agent』，或换一个空闲 spaceId)： " +
+          String((e && e.message) || e).slice(0, 100),
+      );
+    }
     task = await takeOverTaskSpace(spaceId);
   }
   const tabs = await task.tabs();
@@ -1732,15 +1856,17 @@ export async function clickAddSpecType(page, { expectN = null, timeoutMs = 12000
 /** 读规格分组：返回 {type1,type2,groups:[[...],[...]], rows} */
 export async function readSpecGroups(page) {
   return page.evaluate(() => {
-    const all = [
-      ...document.querySelectorAll(
-        'input[placeholder="规格类型1"], input[placeholder="规格类型2"], input[placeholder="请输入规格名称"]'
-      ),
-    ];
+    // 规格类型 + 规格值输入（不同类目 placeholder 不同：背景墙贴=「请输入规格名称」，地毯=「自定义颜色/自定义尺寸」）
+    const isTypeInput = (i) => i.placeholder === "规格类型1" || i.placeholder === "规格类型2";
+    const isValueInput = (i) => {
+      const ph = i.placeholder || "";
+      return ph === "请输入规格名称" || ph === "请输入规格值" || (ph.startsWith("自定义") && ph !== "自定义厚度" && ph !== "自定义厚度排序");
+    };
+    const all = [...document.querySelectorAll("input")].filter((i) => i.offsetParent && (isTypeInput(i) || isValueInput(i)));
     const t1 = all.find((e) => e.placeholder === "规格类型1");
     const t2 = all.find((e) => e.placeholder === "规格类型2");
     const t2i = t2 ? all.indexOf(t2) : -1;
-    const chips = [...document.querySelectorAll('input[placeholder="请输入规格名称"]')];
+    const chips = all.filter(isValueInput);
     const g1 = [];
     const g2 = [];
     for (const c of chips) {
@@ -1770,7 +1896,7 @@ export async function removeSpecValue(page, group, value) {
       ];
       const t2 = all.find((e) => e.placeholder === "规格类型2");
       const t2i = t2 ? all.indexOf(t2) : -1;
-      const chips = [...document.querySelectorAll('input[placeholder="请输入规格名称"]')];
+      const chips = all.filter(isValueInput);
       const pool = chips
         .map((c) => ({ ci: chips.indexOf(c), c }))
         .filter(({ c }) => c.offsetParent && (g === 2 ? t2i >= 0 && all.indexOf(c) > t2i : t2i < 0 || all.indexOf(c) < t2i));
@@ -1798,14 +1924,16 @@ export async function removeSpecValue(page, group, value) {
 /** 提交一个规格值（点空槽 → insertText → Tab；与插件 robustCommitSpecValue 同法） */
 export async function robustCommitSpecValue(page, group, value) {
   const ci = await page.evaluate((g) => {
-    const all = [
-      ...document.querySelectorAll(
-        'input[placeholder="规格类型1"], input[placeholder="规格类型2"], input[placeholder="请输入规格名称"]'
-      ),
-    ];
+    // 规格类型 + 规格值输入（不同类目 placeholder 不同：背景墙贴=「请输入规格名称」，地毯=「自定义颜色/自定义尺寸」）
+    const isTypeInput = (i) => i.placeholder === "规格类型1" || i.placeholder === "规格类型2";
+    const isValueInput = (i) => {
+      const ph = i.placeholder || "";
+      return ph === "请输入规格名称" || ph === "请输入规格值" || (ph.startsWith("自定义") && ph !== "自定义厚度" && ph !== "自定义厚度排序");
+    };
+    const all = [...document.querySelectorAll("input")].filter((i) => i.offsetParent && (isTypeInput(i) || isValueInput(i)));
     const t2 = all.find((e) => e.placeholder === "规格类型2");
     const t2i = t2 ? all.indexOf(t2) : -1;
-    const chips = [...document.querySelectorAll('input[placeholder="请输入规格名称"]')];
+    const chips = all.filter(isValueInput);
     const pool = chips
       .map((c) => ({ ci: chips.indexOf(c), c }))
       .filter(({ c }) => c.offsetParent && (g === 2 ? t2i >= 0 && all.indexOf(c) > t2i : t2i < 0 || all.indexOf(c) < t2i));
@@ -1816,7 +1944,13 @@ export async function robustCommitSpecValue(page, group, value) {
   if (ci < 0) return { ok: false, reason: "no_slot" };
 
   const pos = await page.evaluate((i) => {
-    const c = document.querySelectorAll('input[placeholder="请输入规格名称"]')[i];
+    const isValueInput = (e) => {
+      const ph = e.placeholder || "";
+      return ph === "请输入规格名称" || ph === "请输入规格值"
+        || (ph.startsWith("自定义") && ph !== "自定义厚度" && ph !== "自定义厚度排序");
+    };
+    const chips = [...document.querySelectorAll("input")].filter((e) => e.offsetParent && isValueInput(e));
+    const c = chips[i];
     if (!c) return null;
     c.scrollIntoView({ block: "center" });
     const r = c.getBoundingClientRect();
@@ -1825,22 +1959,301 @@ export async function robustCommitSpecValue(page, group, value) {
   if (!pos) return { ok: false, reason: "no_pos" };
   await page.mouse.click(pos.x, pos.y, { label: "spec slot" });
   await sleep(150);
-  const cur = await page.evaluate((i) => (document.querySelectorAll('input[placeholder="请输入规格名称"]')[i] || {}).value || "", ci);
+  const cur = await page.evaluate((i) => {
+    const isValueInput = (e) => {
+      const ph = e.placeholder || "";
+      return ph === "请输入规格名称" || ph === "请输入规格值"
+        || (ph.startsWith("自定义") && ph !== "自定义厚度" && ph !== "自定义厚度排序");
+    };
+    const chips = [...document.querySelectorAll("input")].filter((e) => e.offsetParent && isValueInput(e));
+    return (chips[i] || {}).value || "";
+  }, ci);
   if (cur) {
     await page.keyboard.press("Control+a");
     await page.keyboard.press("Backspace");
     await sleep(120);
   }
   await page.keyboard.insertText(String(value));
-  await sleep(150);
-  await page.keyboard.press("Tab");
-  await sleep(450);
+  await sleep(250);
+  // 提交：先 Enter（部分类目回车即落值并自动新增空槽），没落值再 Tab 兜底
+  await page.keyboard.press("Enter");
+  await sleep(800);
+  const landed = await page.evaluate((v) => {
+    const isValueInput = (e) => {
+      const ph = e.placeholder || "";
+      return ph === "请输入规格名称" || ph === "请输入规格值"
+        || (ph.startsWith("自定义") && ph !== "自定义厚度" && ph !== "自定义厚度排序");
+    };
+    return [...document.querySelectorAll("input")].some((e) => e.offsetParent && isValueInput(e) && (e.value || "").trim() === v);
+  }, String(value));
+  if (!landed) {
+    await page.keyboard.press("Tab");
+    await sleep(500);
+  }
   return { ok: true };
 }
 
 /** 规格矩阵：按维度值补齐/清理，校验行数 = 笛卡尔积（自愈，最多 3 轮） */
-export async function ensureSpecTable(page, dimNames, dimValues, { maxRound = 3, precheck = true } = {}) {
-  const expect = (dimValues[0] || []).length * (dimValues[1] || []).length;
+
+/**
+ * 类目自带「规格/属性」区块填充（通用探测，不写死类目名）
+ *
+ * 实测（地毯类目 2026-11-23）：
+ *  - 「颜色分类」：主色 + 备注 成对输入，填一组后会自动多出空行；它是**商品级属性**，不是 SKU 维度
+ *    （删掉「颜色」规格类型后矩阵只剩尺寸 5 行，可证）
+ *  - 「厚度」：checkbox 勾选 + 自定义厚度(mm) 输入；同类目只有一个厚度时可留空，测试时可填值
+ *
+ * 因此本函数只负责：把这些"自带区块"填上值，SKU 矩阵仍由 ensureSpecTable 建规格类型。
+ * 返回值用于日志与校验：{ colorCat: {filled}, thickness: {checked, filled} }
+ */
+export async function fillCatalogBuiltinZones(page, dimNames, dimValues, attributes = {}, decisions = {}, opts = {}) {
+
+  // decisions：{ 自带区标签: 维度名 | "ignore" } —— 由用户确认后写进 run-config.builtinDecisions
+  // 探测到但**没能自动匹配**的自带区会进 unmatched，调用方必须先问用户再决定（不要静默走规格类型）
+  // ── 实时探测 + 通用填充（不写死类目名）──
+  // 扫「商品规格」区：短中文标签 + 控件；同义词把标签与维度配对；
+  // 文本型按 **placeholder 特征**定位值框（成组时第二个=备注，不会被误填）；复选框型勾选+可选填值。
+  const SYN = {
+    颜色: ["颜色分类", "颜色", "花色", "色系", "主色"],
+    尺寸: ["尺寸", "尺码", "大小"],
+    厚度: ["厚度", "薄厚"],
+    款式: ["款式", "样式", "型号"],
+    材质: ["材质", "面料"],
+    克重: ["克重", "平方克重", "重量", "毯重"],
+  };
+  const NOISE = /商品规格|请依据|请选择|请输入|添加规格|删除|排序|上传|展开|收起|自定义|全部|批量|搜索/;
+
+  // ① 探测
+  const scan = await page
+    .evaluate(() => {
+      const n = (s) => (s || "").replace(/\s+/g, " ").trim();
+      const vis = (e) => !!(e && e.offsetParent);
+      const spec = [...document.querySelectorAll("*")].filter(
+        (e) => vis(e) && !e.children.length && n(e.textContent) === "商品规格",
+      )[0];
+      if (!spec) return { ok: false, zones: [] };
+      let block = spec;
+      for (let i = 0; i < 7 && block; i++) {
+        block = block.parentElement;
+        if (block && block.querySelectorAll("input").length >= 1) break;
+      }
+      if (!block) return { ok: false, zones: [] };
+      const SKIP = /商品规格|请依据|请选择|请输入|添加规格|删除|排序|上传|展开|收起|自定义|全部|批量|搜索|规格类型/;
+      const zones = [];
+      const seen = new Set();
+      const labels = [...block.querySelectorAll("*")].filter((e) => {
+        if (!vis(e) || e.children.length) return false;
+        const t = n(e.textContent);
+        if (!t || t.length > 6) return false;          // 标签都很短；长文本多为提示
+        if (SKIP.test(t)) return false;
+        return /[一-龥]/.test(t);
+      });
+      for (const lab of labels) {
+        const name = n(lab.textContent);
+        if (seen.has(name)) continue;
+        let row = lab;
+        let hit = null;
+        for (let i = 0; i < 4 && row; i++) {
+          row = row.parentElement;
+          if (!row) break;
+          const ins = [...row.querySelectorAll("input")].filter(vis);
+          if (!ins.length) continue;
+          const txt = ins.filter((x) => x.type === "text" || x.type === "number");
+          const cbx = ins.filter((x) => x.type === "checkbox");
+          // 真实控件：文本输入要有非空 placeholder（"选择或输入主色"/"备注（偏深/浅等）"/"自定义厚度"）
+          const phs = txt.map((x) => x.placeholder || "").filter(Boolean);
+          if (!cbx.length && !phs.length) continue;
+          hit = { text: txt.length, checkbox: cbx.length, placeholders: txt.map((x) => x.placeholder || "").slice(0, 4) };
+          break;
+        }
+        if (!hit) continue;
+        seen.add(name);
+        zones.push({ label: name, ...hit });
+      }
+      return { ok: true, zones };
+    })
+    .catch(() => ({ ok: false, zones: [] }));
+
+  const ZONES = Array.isArray(scan.zones) ? scan.zones : [];
+  const findZone = (dim) => {
+    const base = String(dim).replace(/分类$/, "").replace(/\s+/g, "");
+    const cands = SYN[base] || [String(dim)];
+    return (
+      ZONES.find((z) => z.label.length <= 6 && cands.some((c) => z.label === c)) ||          // 精确优先
+      ZONES.find((z) => z.label.length <= 6 && cands.some((c) => z.label.includes(c))) ||
+      null
+    );
+  };
+
+  const out = {
+    probe: ZONES.map((z) => ({ label: z.label, shape: z.checkbox > 0 ? "checkbox+" + (z.text > 0 ? "number" : "none") : z.text > 1 ? "text-pair" : "text", ph: z.placeholders })),
+    filled: {},
+    skipped: [],
+    unmatched: [],
+    decisionsUsed: {},
+  };
+
+  // 值框定位：优先按 placeholder 特征（zone.placeholders 里第一个非备注的），否则按组宽取第 k 组第 1 框
+  const locateValueBox = async (zone, k) => {
+    const valuePh = (zone.placeholders || []).find((p) => p && !/备注/.test(p)) || "";
+    return page
+      .evaluate((a) => {
+        const n = (s) => (s || "").replace(/\s+/g, " ").trim();
+        const vis = (e) => !!(e && e.offsetParent);
+        const L = [...document.querySelectorAll("*")].filter((e) => vis(e) && !e.children.length && n(e.textContent) === a.label)[0];
+        if (!L) return null;
+        let row = L;
+        for (let i = 0; i < 4 && row; i++) {
+          row = row.parentElement;
+          if (!row) break;
+          // 该 zone 所在容器的祖先里找所有文本输入框（含后续自动新增的行）
+          const scope = row.parentElement || row;
+          const all = [...scope.querySelectorAll("input")].filter(vis).filter((x) => x.type === "text" || x.type === "number");
+          if (!all.length) continue;
+          let target = null;
+          if (a.valuePh) {
+            target = all.find((x) => !(x.value || "").trim() && (x.placeholder || "").indexOf(a.valuePh) >= 0);
+          }
+          if (!target) {
+            const groupW = Math.max(1, a.groupW || 1);
+            const idx = a.k * groupW;
+            target = all[idx] || null;
+            if (target && (target.value || "").trim()) target = all.find((x) => !(x.value || "").trim()) || null;
+          }
+          if (!target) return null;
+          target.scrollIntoView({ block: "center" });
+          const r = target.getBoundingClientRect();
+          return { x: Math.round(r.x + r.width / 2), y: Math.round(r.y + r.height / 2) };
+        }
+        return null;
+      }, { label: zone.label, valuePh, k, groupW: zone.text })
+      .catch(() => null);
+  };
+
+  const locateCheckbox = async (label) =>
+    page
+      .evaluate((lab) => {
+        const n = (s) => (s || "").replace(/\s+/g, " ").trim();
+        const vis = (e) => !!(e && e.offsetParent);
+        const L = [...document.querySelectorAll("*")].filter((e) => vis(e) && !e.children.length && n(e.textContent) === lab)[0];
+        if (!L) return null;
+        let row = L;
+        for (let i = 0; i < 4 && row; i++) {
+          row = row.parentElement;
+          if (!row) break;
+          const cb = [...row.querySelectorAll("input[type=checkbox]")].filter(vis)[0];
+          if (!cb) continue;
+          cb.scrollIntoView({ block: "center" });
+          const r = cb.getBoundingClientRect();
+          return { x: Math.round(r.x + r.width / 2), y: Math.round(r.y + r.height / 2), checked: !!cb.checked };
+        }
+        return null;
+      }, label)
+      .catch(() => null);
+
+  // ② 文本型：逐值填「值框」，备注框保持空
+  const fillTextZone = async (zone, values) => {
+    const done = [];
+    for (let k = 0; k < values.length; k++) {
+      const pos = await locateValueBox(zone, k);
+      if (!pos) break;
+      await page.mouse.click(pos.x, pos.y, { label: "builtin " + zone.label });
+      await sleep(300);
+      await page.keyboard.insertText(String(values[k]));
+      await sleep(950);
+      await page.keyboard.press("Enter").catch(() => {});
+      await sleep(1000);
+      done.push(String(values[k]));
+    }
+    return { mode: "text", filled: done, want: values.length };
+  };
+
+  // ③ 复选框 + 数值
+  const fillCheckboxZone = async (zone, values) => {
+    // 复选框型（厚度等）：默认**只勾选不填值**（同类目只有一个厚度时留空即可）；
+    // 需要填值时在 run-config 里设 "builtinCheckboxValue": "auto"
+    const MODE = String(opts && opts.checkboxValue ? opts.checkboxValue : "skip").toLowerCase();
+    const tv = MODE === "auto"
+      ? String((attributes && ((attributes[zone.label] || [])[0] || (attributes["厚度"] || [])[0])) || (values || [])[0] || "").trim()
+      : "";
+    const cb = await locateCheckbox(zone.label);
+    if (cb && !cb.checked) {
+      await page.mouse.click(cb.x, cb.y, { label: "builtin-cbx " + zone.label });
+      await sleep(1000);
+    }
+    let wrote = null;
+    if (tv) {
+      const pos = await locateValueBox({ ...zone, placeholders: (zone.placeholders || []).filter((p) => /厚度|自定义/.test(p)) }, 0);
+      if (pos) {
+        await page.mouse.click(pos.x, pos.y, { label: "builtin-val " + zone.label });
+        await sleep(200);
+        await page.keyboard.insertText(tv.replace(/[^\d.]/g, "") || tv);
+        await sleep(500);
+        await page.keyboard.press("Tab").catch(() => {});
+        wrote = tv;
+      }
+    }
+    return { mode: "checkbox", checked: !!cb, value: wrote };
+  };
+
+  // ④ 维度 → 自带区
+  for (let i = 0; i < (dimNames || []).length; i++) {
+    const dim = dimNames[i];
+    const zone = findZone(dim);
+    if (!zone) {
+      out.skipped.push(String(dim));
+      continue;
+    }
+    const values = (dimValues[i] || []).map(String);
+    const r = zone.checkbox > 0 && !(zone.placeholders || []).some((p) => !/备注/.test(p) && p)
+      ? await fillCheckboxZone(zone, values)
+      : await fillTextZone(zone, values);
+    out.filled[String(dim)] = { label: zone.label, ...r };
+  }
+
+  // ⑤ 额外自带区（维度表里没有，如厚度）：勾选 + 属性有值则填
+  for (const z of ZONES) {
+    const already = Object.values(out.filled).some((x) => x && x.label === z.label);
+    if (already) continue;
+    const av = attributes ? attributes[z.label] || attributes["厚度"] : null;
+    if (z.checkbox > 0 && av && av.length) {
+      out.filled[z.label] = { label: z.label, ...(await fillCheckboxZone(z, av)) };
+    }
+  }
+
+  // ⑥ 用户决策：把「没能自动匹配」的自带区绑到某个维度（或显式忽略）
+  const filledByLabel = new Set(Object.values(out.filled).map((x) => x && x.label));
+  for (const z of ZONES) {
+    if (filledByLabel.has(z.label)) continue;
+    const dec = decisions ? decisions[z.label] : null;
+    if (!dec) {
+      out.unmatched.push({ label: z.label, shape: z.checkbox > 0 ? "checkbox+number" : z.text > 1 ? "text-pair" : "text", ph: z.placeholders });
+      continue;
+    }
+    if (String(dec).toLowerCase() === "ignore") {
+      out.decisionsUsed[z.label] = "ignore";
+      continue;
+    }
+    const idx = (dimNames || []).findIndex((d) => String(d) === String(dec) || String(d).replace(/分类$/, "") === String(dec));
+    if (idx < 0) {
+      out.unmatched.push({ label: z.label, shape: "unknown", ph: z.placeholders, decisionInvalid: String(dec) });
+      continue;
+    }
+    const values = (dimValues[idx] || []).map(String);
+    const r = z.checkbox > 0 ? await fillCheckboxZone(z, values) : await fillTextZone(z, values);
+    out.filled[String(dimNames[idx])] = { label: z.label, byDecision: String(dec), ...r };
+    out.skipped = (out.skipped || []).filter((d) => String(d) !== String(dimNames[idx]));
+    out.decisionsUsed[z.label] = String(dec);
+  }
+
+  return out;
+}
+
+export async function ensureSpecTable(page, dimNames, dimValues, { maxRound = 3, precheck = true, expectRows = 0 } = {}) {
+  // expectRows：维度可能由「类目自带区块」承载（如颜色分类不建规格类型），矩阵行数仍按全维度乘积校验
+  const expect = Number(expectRows) > 0
+    ? Number(expectRows)
+    : (dimValues[0] || []).length * (dimValues[1] || []).length;
   // 预检：值里带非法字符会让平台把矩阵建成 0 行，必须在点任何东西之前拦下来
   if (precheck) {
     const sv = validateSpecValues(dimNames, dimValues);
@@ -1951,7 +2364,17 @@ export async function countMatrixKeys(page, dimNames, dimValues) {
         const out = [];
         for (const tr of [...document.querySelectorAll("tbody tr")]) {
           const text = (tr.textContent || "").replace(/\s+/g, " ").trim();
-          for (const v of D0) if (text.includes(v)) { sticky = v; break; }
+          for (const v of D0) {
+          if (text.includes(v)) { sticky = v; break; }
+          // 颜色分类等自带维度会把值拆成「主色 + 备注」两个 chip，行文本里是 "卡其色 经典百搭/自由拼接"
+          const j1 = String(v).indexOf("【");
+          if (j1 > 0) {
+            const main = String(v).slice(0, j1).trim();
+            const j2 = String(v).indexOf("】", j1);
+            const note = String(v).slice(j1 + 1, j2 > 0 ? j2 : undefined).trim();
+            if (main && text.includes(main) && (!note || text.includes(note))) { sticky = v; break; }
+          }
+        }
           let d1 = "";
           for (let i = 0; i < D1.length; i++) if (text.includes(D1[i])) { d1 = D1[i]; break; }
           if (!d1) for (let i = 0; i < D1.length; i++) {
@@ -2007,7 +2430,8 @@ export async function setSpecType(page, typeIndex, name) {
     if (!target) {
       target = opts.find((el) => {
         const t = (el.textContent || "").trim();
-        return t === n || t.startsWith(n) || t.includes(n);
+        // 正向：选项文本包含目标名；反向：目标名包含选项文本（如「颜色分类」→「颜色」）
+        return t === n || t.startsWith(n) || t.includes(n) || (t.length >= 2 && n.includes(t));
       });
     }
     if (!target) return "no_match:" + opts.map((el) => (el.textContent || "").trim()).slice(0, 8).join(",");
@@ -2099,10 +2523,75 @@ export async function fillSkuRowsCDP(page, P, { rounds = 2, step = 120, pauseMs 
         const key = sticky + "|" + d1;
         const w = wmap.get(key);
         if (!w) continue;
-        const inputs = [...tr.querySelectorAll('input[placeholder="请输入"]')].filter((e) => e.offsetParent);
-        if (inputs.length !== 4) continue;
+        // ★ 价格表实时识别（不写死列位置）：读表头那一行，按列名匹配关键词 → 得到「输入列」顺序
+        //   行内输入框再按这个顺序对齐，天然兼容任意维度列数 + 合并单元格（td 数量变化也不影响）
+        if (!stepFn.inputCols) {
+          const hr = [...document.querySelectorAll("tr")].find(
+            (r) => /库存/.test(r.innerText || "") && /拼单价/.test(r.innerText || ""),
+          );
+          const ht = hr ? [...hr.children].map((c) => (c.innerText || "").replace(/\s+/g, " ").trim()) : [];
+          const KEYS = [
+            { key: "stock", re: /库存/ },
+            { key: "group", re: /拼单价/ },
+            { key: "single", re: /单买价/ },
+            { key: "code", re: /规格编码/ },
+            { key: "goodsCode", re: /商品编码/ },
+            { key: "barCode", re: /条码/ },
+            { key: "weight", re: /重量/ },
+          ];
+          stepFn.inputCols = ht
+            .map((t, i) => {
+              const m = KEYS.find((x) => x.re.test(t));
+              return m ? { key: m.key, col: i, text: t } : null;
+            })
+            .filter(Boolean);
+          stepFn.colIdx = {
+            stock: (stepFn.inputCols.find((c) => c.key === "stock") || {}).col,
+            group: (stepFn.inputCols.find((c) => c.key === "group") || {}).col,
+            single: (stepFn.inputCols.find((c) => c.key === "single") || {}).col,
+            code: (stepFn.inputCols.find((c) => c.key === "code") || {}).col,
+          };
+        }
+        const ci2 = stepFn.colIdx || {};
+        const tds = [...tr.children].filter((x) => x.tagName === "TD");
+        // ❗合并单元格（颜色分类/厚度 rowspan）会让该行的 td **数量变少**，列号无法从前端对齐。
+        // 价格列固定在行尾 → 从末尾倒推：状态(1) 规格编码(2) 预览图(3) 单买价(4) 拼单价(5) 库存(6)
+        const pickEnd = (k) => {
+          const td = tds[tds.length - k];
+          if (!td) return null;
+          return [...td.querySelectorAll("input")].find((x) => x.offsetParent && x.type !== "file") || null;
+        };
+        const pickCol = (i) => {
+          // 兼容：若调用方仍传列号，仅当 tds 数量 >= 表头列数时按列取，否则返回 null（走倒推）
+          if (i === null || i === undefined || i < 0) return null;
+          const td = tds[i];
+          if (!td || tds.length < (stepFn.colIdx && stepFn.colIdx.headCount ? stepFn.colIdx.headCount : 9)) return null;
+          return [...td.querySelectorAll("input")].find((x) => x.offsetParent && x.type !== "file") || null;
+        };
+        // 行内可见文本输入（顺序 = DOM 顺序），与表头输入列顺序一一对齐
+        const rowIns = [...tr.querySelectorAll('input[placeholder="请输入"]')]
+          .filter((x) => x.offsetParent && x.type !== "file");
+        const inputCols = stepFn.inputCols || [];
+        const byName = (name) => {
+          const ci = inputCols.findIndex((c) => c.key === name);
+          return ci >= 0 ? rowIns[ci] || null : null;
+        };
+        let inStock = byName("stock") || pickEnd(6) || pickCol(ci2.stock);
+        let inGroup = byName("group") || pickEnd(5) || pickCol(ci2.group);
+        let inSingle = byName("single") || pickEnd(4) || pickCol(ci2.single);
+        let inCode = byName("code") || pickEnd(2) || pickCol(ci2.code);
+        // 兜底：表头没读到就按顺序取前 4 个
+        if (!inStock || !inGroup || !inSingle || !inCode) {
+          const inputs = [...tr.querySelectorAll('input[placeholder="请输入"]')].filter((e) => e.offsetParent);
+          if (inputs.length < 4) continue;
+          inStock = inStock || inputs[0];
+          inGroup = inGroup || inputs[1];
+          inSingle = inSingle || inputs[2];
+          inCode = inCode || inputs[3];
+        }
+        const inputs = [inStock, inGroup, inSingle, inCode];
         const t = [String(w.stock), String(w.group_price), String(w.single_price), String(w.code)];
-        for (let k = 0; k < 4; k++) if (setVal(inputs[k], t[k])) writes++;
+        for (let k = 0; k < 4; k++) if (inputs[k] && setVal(inputs[k], t[k])) writes++;
         const cell = tr.querySelector("td.sku-preview-cell");
         const hasImg = !!(cell && (cell.querySelector("img") || cell.querySelector('[style*="background-image"]')));
         seen.set(key, { vals: inputs.map((e) => e.value), img: hasImg });
@@ -2128,7 +2617,26 @@ export async function fillSkuRowsCDP(page, P, { rounds = 2, step = 120, pauseMs 
       if (g.img) img++;
     }
     const stockSum = [...seen.values()].reduce((x, y) => x + (Number(y.vals[0]) || 0), 0);
-    return { writes, covered: seen.size, ok, img, bad: bad.slice(0, 6), stockSum };
+    // 诊断：列结构（表头单元格数、首行 td 数、每 td 输入框数），用于排查维度列/商品编码列导致的错位
+    const diag = (() => {
+      try {
+        const hr = [...document.querySelectorAll("tr")].find((r) => /库存/.test(r.innerText || "") && /拼单价/.test(r.innerText || ""));
+        const hc = hr ? [...hr.children] : [];
+        const ftr = [...document.querySelectorAll("tbody tr")].find((t) => t.offsetParent);
+        const tds = ftr ? [...ftr.children].filter((x) => x.tagName === "TD") : [];
+        return {
+          colIdx: stepFn.colIdx || null,
+          headCount: hc.length,
+          headTexts: hc.map((c) => (c.innerText || "").replace(/\s+/g, " ").trim().slice(0, 10)),
+          tdCount: tds.length,
+          tdInputs: tds.map((td) => [...td.querySelectorAll("input")].filter((x) => x.offsetParent).length),
+          seenVals: [...seen.values()].slice(0, 3).map((g) => g.vals),
+        };
+      } catch (e) {
+        return { err: String(e.message).slice(0, 80) };
+      }
+    })();
+    return { writes, covered: seen.size, ok, img, bad: bad.slice(0, 6), stockSum, diag };
   }`;
 
   const t0 = Date.now();
@@ -2273,7 +2781,16 @@ export async function readAllSkuRows(page, { rowFilter = null, mapRow = null, st
         .map((tr) => {
           const vals = [...tr.querySelectorAll('input[placeholder="请输入"]')].filter((e) => e.offsetParent).map((e) => e.value);
           const cell = tr.querySelector("td.sku-preview-cell");
-          const img = !!(cell && (cell.querySelector("img") || cell.querySelector('[style*="background-image"]')));
+          const img = (() => {
+  const pvCell = cell;
+  if (!pvCell) return false;
+  if ([...pvCell.querySelectorAll("img")].some((i) => /pfs\.pinduoduo|pddpic/i.test(i.getAttribute("src") || ""))) return true;
+  for (const el of [pvCell, ...pvCell.querySelectorAll("*")]) {
+    const bg = (getComputedStyle(el).backgroundImage || "") + " " + (el.getAttribute && (el.getAttribute("style") || ""));
+    if (/pfs\.pinduoduo|pddpic/i.test(bg)) return true;
+  }
+  return false;
+})();
           return { text: (tr.textContent || "").replace(/\s+/g, " ").trim(), vals, img };
         });
     }).catch(() => []);
@@ -2521,7 +3038,17 @@ export async function uploadMissingPreviews(page, P, { colorToFile = {}, preview
           if (!tr) return null;
           tr.setAttribute("data-row", "r" + idx);
           const text = (tr.textContent || "").replace(/\s+/g, " ").trim();
-          const hasImg = !!(tr.querySelector("img") || tr.querySelector('[style*="background-image"]'));
+          // 统一判据：预览格内任意元素（含 span.imgContainer 的背景图）含 pfs 即视为有图
+          const hasImg = (() => {
+  const cell = tr.querySelector("td.sku-preview-cell");
+  if (!cell) return false;
+  if ([...cell.querySelectorAll("img")].some((i) => /pfs\.pinduoduo|pddpic/i.test(i.getAttribute("src") || ""))) return true;
+  for (const el of [cell, ...cell.querySelectorAll("*")]) {
+    const bg = (getComputedStyle(el).backgroundImage || "") + " " + (el.getAttribute && (el.getAttribute("style") || ""));
+    if (/pfs\.pinduoduo|pddpic/i.test(bg)) return true;
+  }
+  return false;
+})();
           const f = tr.querySelector('input[type=file]');
           if (f) f.setAttribute("data-ego", "in" + idx);
           return { text, hasImg, hasInput: !!f, sel: f ? 'css:input[data-ego="in' + idx + '"]' : null };
@@ -2548,7 +3075,16 @@ export async function uploadMissingPreviews(page, P, { colorToFile = {}, preview
             const st2 = await page.evaluate((idx) => {
               const tr = document.querySelector('[data-row="r' + idx + '"]');
               if (!tr) return null;
-              return !!(tr.querySelector("img") || tr.querySelector('[style*="background-image"]'));
+              return (() => {
+  const cell = tr.querySelector("td.sku-preview-cell");
+  if (!cell) return false;
+  if ([...cell.querySelectorAll("img")].some((i) => /pfs\.pinduoduo|pddpic/i.test(i.getAttribute("src") || ""))) return true;
+  for (const el of [cell, ...cell.querySelectorAll("*")]) {
+    const bg = (getComputedStyle(el).backgroundImage || "") + " " + (el.getAttribute && (el.getAttribute("style") || ""));
+    if (/pfs\.pinduoduo|pddpic/i.test(bg)) return true;
+  }
+  return false;
+})();
             }, i).catch(() => null);
             if (st2 === true) { uploaded = true; break; }
             if (st2 === null) break; // 节点被替换，交给下一遍
@@ -2579,7 +3115,16 @@ export async function uploadMissingPreviews(page, P, { colorToFile = {}, preview
               const ok = await page.evaluate((idx) => {
                 const trs = [...document.querySelectorAll("tbody tr")].filter((t) => t.offsetParent);
                 const tr = trs[idx];
-                return !!(tr && (tr.querySelector("img") || tr.querySelector('[style*="background-image"]')));
+                return (() => {
+  const cell = tr ? tr.querySelector("td.sku-preview-cell") : null;
+  if (!cell) return false;
+  if ([...cell.querySelectorAll("img")].some((i) => /pfs\.pinduoduo|pddpic/i.test(i.getAttribute("src") || ""))) return true;
+  for (const el of [cell, ...cell.querySelectorAll("*")]) {
+    const bg = (getComputedStyle(el).backgroundImage || "") + " " + (el.getAttribute && (el.getAttribute("style") || ""));
+    if (/pfs\.pinduoduo|pddpic/i.test(bg)) return true;
+  }
+  return false;
+})();
               }, i).catch(() => false);
               if (ok) uploaded = true;
             } catch (e) {}
@@ -2769,10 +3314,16 @@ export async function validateForm(page, P) {
       props[lab] = (input && input.value) || sv || "";
     }
 
-    const all = [...document.querySelectorAll('input[placeholder="规格类型1"], input[placeholder="规格类型2"], input[placeholder="请输入规格名称"]')];
+    const isTypeInput = (i) => i.placeholder === "规格类型1" || i.placeholder === "规格类型2";
+    const isValueInput = (i) => {
+      const ph = i.placeholder || "";
+      return ph === "请输入规格名称" || ph === "请输入规格值"
+        || (ph.startsWith("自定义") && ph !== "自定义厚度" && ph !== "自定义厚度排序");
+    };
+    const all = [...document.querySelectorAll("input")].filter((i) => i.offsetParent && (isTypeInput(i) || isValueInput(i)));
     const t2 = all.find((e) => e.placeholder === "规格类型2");
     const t2i = t2 ? all.indexOf(t2) : -1;
-    const chips = [...document.querySelectorAll('input[placeholder="请输入规格名称"]')];
+    const chips = all.filter(isValueInput);
     const dim1 = chips.filter((c) => !(t2i >= 0 && all.indexOf(c) > t2i)).map((c) => c.value).filter(Boolean);
     const dim2 = chips.filter((c) => t2i >= 0 && all.indexOf(c) > t2i).map((c) => c.value).filter(Boolean);
 
@@ -2863,6 +3414,7 @@ export async function validateForm(page, P) {
       whiteBgDone,
       whiteBgInfo,
       errs: (t.match(/错误（(\d+)）/) || [])[1] || null,
+      colorCatCount: [...document.querySelectorAll("input")].filter((i) => i.offsetParent && i.placeholder === "选择或输入主色" && (i.value || "").trim()).length,
     };
   });
 
@@ -2876,14 +3428,28 @@ export async function validateForm(page, P) {
   add("brand", raw.brand === String(P.brand || "") ? "pass" : "fail", raw.brand);
   for (const [k, arr] of Object.entries(P.attributes || {})) {
     const want = String((arr && arr[0]) ?? "");
+    if (!(k in (raw.props || {}))) {
+      add("attr_" + k, "pass", "(该类目无此属性，跳过)");
+      continue;
+    }
     const got = raw.props[k] || "";
     add("attr_" + k, got.includes(want) ? "pass" : "fail", got || "(空)");
   }
   const V0 = [...new Set(SKUS.map((s) => String(s[DIMS[0]] ?? "")))];
   const V1 = [...new Set(SKUS.map((s) => String(s[DIMS[1]] ?? "")))];
-  add("spec_types", raw.type1 === DIMS[0] && raw.type2 === DIMS[1] ? "pass" : "fail", raw.type1 + "/" + raw.type2);
-  add("spec_values_dim1", raw.dim1.length === V0.length ? "pass" : "fail", JSON.stringify(raw.dim1));
-  add("spec_values_dim2", raw.dim2.length === V1.length ? "pass" : "fail", JSON.stringify(raw.dim2));
+  const normDim = (x) => String(x || "").replace(/分类$/, "").trim();
+  // 类目自带「颜色分类」承载第一维时，规格类型只剩第二维（尺寸）
+  const BUILTIN_COLOR = (raw.colorCatCount || 0) > 0 && /颜色/.test(String(DIMS[0] || ""));
+  if (BUILTIN_COLOR) {
+    add("spec_types", normDim(raw.type1) === normDim(DIMS[1]) ? "pass" : "fail", "颜色分类(自带)/" + raw.type1);
+    add("spec_values_dim1", (raw.colorCatCount || 0) >= V0.length ? "pass" : "fail", "颜色分类 " + (raw.colorCatCount || 0) + "/" + V0.length);
+    add("spec_values_dim2", (raw.dim1 || []).length >= V1.length ? "pass" : "fail", JSON.stringify(raw.dim1));
+  } else {
+    add("spec_types", normDim(raw.type1) === normDim(DIMS[0]) && normDim(raw.type2) === normDim(DIMS[1]) ? "pass" : "fail", raw.type1 + "/" + raw.type2);
+    add("spec_values_dim1", raw.dim1.length === V0.length ? "pass" : "fail", JSON.stringify(raw.dim1));
+    add("spec_values_dim2", raw.dim2.length === V1.length ? "pass" : "fail", JSON.stringify(raw.dim2));
+  }
+
   // 虚拟列表下 raw.rows 只是可见行（如 72 行只渲染 18 行）→ 用跨窗口扫描结果
   const scannedCount = scanned.count || raw.rows;
   const scannedFilled = scanned.rows.filter((r) => (r.inputs || []).slice(0, 4).every((x) => String(x || "").trim())).length;
@@ -3234,6 +3800,7 @@ export async function submitProduct(page, vf, { timeoutMs = 45000 } = {}) {
   // 真正判据：URL 跳到 goods_add/success；中间可能出现「确定/确认」低价提醒弹窗
   const deadline = Date.now() + timeoutMs;
   let confirmed = null;
+  let lastDiag = null;
   let sawSubmitting = false;
   let lastUrl = "";
   while (Date.now() < deadline) {
@@ -3252,11 +3819,15 @@ export async function submitProduct(page, vf, { timeoutMs = 45000 } = {}) {
           dpos = { x: Math.round(r.x + r.width / 2), y: Math.round(r.y + r.height / 2), txt: norm(b.innerText) };
         }
         const subBtn = btns.find((b) => /提交中/.test(norm(b.innerText)));
-        return { url: location.href, dialogPos: dpos, submitting: !!subBtn };
+        const t = norm(document.body.innerText);
+        const tips = t.split(/\n|\r/).map(norm).filter((x) => x && x.length < 90 && /失败|错误|不能|请补充|必填|拦截|审核|风险|低价|不支持|受限/.test(x)).slice(0, 6);
+        const errN = (t.match(/错误（(\d+)）/) || [])[1] || null;
+        return { url: location.href, dialogPos: dpos, submitting: !!subBtn, diag: { errN, tips, len: t.length } };
       })
       .catch(() => null);
     if (!st) continue;
     lastUrl = st.url || "";
+    if (st.diag) lastDiag = st.diag;
     if (st.submitting) sawSubmitting = true;
     if (/goods_add\/success|success\?goods_id/.test(lastUrl)) break;
     if (st.dialogPos) {
@@ -3275,6 +3846,7 @@ export async function submitProduct(page, vf, { timeoutMs = 45000 } = {}) {
     sawSubmitting,
     goodsId,
     reason: ok ? null : "no_success_url_after_" + timeoutMs + "ms",
+    diag: lastDiag,
   };
 }
 

@@ -9,7 +9,7 @@ import {
   log, sleep, connectShop, dismissOverlays, detectCategoryPage, openManualCategoryPicker, searchCategory,
   gotoUrl, clickText,
   goNextToForm, uploadMainImages, waitMainUploads, waitCategoryPickerReady, fillTitle, uploadZoneFast, readDetailZone, fillBrand,
-  applyAttributesByCandidates, fillDirectAttrs, ensureSpecTable, fillSkuRowsAndVerify,
+  applyAttributesByCandidates, fillDirectAttrs, ensureSpecTable, fillCatalogBuiltinZones, fillSkuRowsAndVerify, fillFullDiscount,
   uploadMissingPreviews, countPreviewCells, setRefPrice, validateForm, readImageCounters, uploadVideo, uploadWhiteBg,
   packagingLabelState, mainImagesState, clearZone, readAllSkuRows, makeStickyMapRow, getScrollMeta,
   checkDuplicate, validateSpecValues, repairSpecMatrix, cleanExtraDetails, openPublishPage, pathSuffixMatch,
@@ -105,7 +105,9 @@ for (const sk of SKUS) sk.preview = posix(sk.preview);
 D.main_images = (D.main_images || []).map(posix);
 D.detail_images = (D.detail_images || []).map(posix);
 
-const conn = await connectShop(SPACE_ID);
+// 默认**复用** run-config 里的 spaceId，且**不抢**用户控制权（被接管时报错，不自动新建空间）
+const ALLOW_TAKE_OVER = CFG.allowTakeOver === true;
+const conn = await connectShop(SPACE_ID, { allowTakeOver: ALLOW_TAKE_OVER });
 const SHOT_DIR = String(CFG.shotDir || ((PRODUCT || "").replace(/\\/g, "/").replace(/\/work\/product\.json$/, "") + "/shots"));
 try { mkdirSync(SHOT_DIR, { recursive: true }); } catch (e) {}
 const SHOT_ON = CFG.shot === true; // 每步截图：显式 shot:true 才开（原版只在末尾拍可选 final.png）
@@ -250,7 +252,8 @@ try {
   await dismissOverlays(page);
 
   // ④ 详情图
-  const dz = await uploadZoneFast(page, "商品详情", 50, D.detail_images, { timeoutMs: 420000, waitMs: 240000 });
+  const DETAIL_MODE = String(CFG.detailMode || "strict").toLowerCase() === "batch" ? "batch" : "strict";
+const dz = await uploadZoneFast(page, "商品详情", 50, D.detail_images, { timeoutMs: 420000, waitMs: 240000, detailMode: DETAIL_MODE });
   console.log("[上架]", stamp(), "④ 详情图 =", JSON.stringify(dz));
   if (dz && dz.failedCount > 0) {
     console.log("[上架]", stamp(), "④ ⚠️ 详情图有上传失败项（平台偶发，计数器会虚高）=", JSON.stringify(dz.failedImgs));
@@ -307,6 +310,22 @@ try {
   const ar = await applyAttributesByCandidates(page, drop);
   console.log("[上架]", stamp(), "⑤ 下拉属性 =", JSON.stringify({ ok: ar.ok, needReview: ar.needReview.map((x) => x.label) }));
   const df = await fillDirectAttrs(page, Object.entries(direct).map(([label, arr]) => ({ label, value: String((arr && arr[0]) || "") })));
+  // ⑤b 品牌复核（属性下拉的打开/关闭可能误点改掉品牌，实测会被改成别的品牌）
+  {
+    const bv = await page
+      .evaluate(() => {
+        const inp = [...document.querySelectorAll("input")].filter((i) => i.offsetParent).find((i) => /请输入品牌名称搜索/.test(i.placeholder || ""));
+        return inp ? inp.value : null;
+      })
+      .catch(() => null);
+    if (bv !== String(P.brand)) {
+      console.log("[上架]", stamp(), "⑤b 品牌被改动(" + bv + ") → 重设为", P.brand);
+      const rb = await fillBrand(page, P.brand).catch((e) => ({ ok: false, err: String(e.message).slice(0, 60) }));
+      console.log("[上架]", stamp(), "⑤b 品牌重设 =", JSON.stringify(rb).slice(0, 140));
+    } else {
+      console.log("[上架]", stamp(), "⑤b 品牌复核 = ok(" + bv + ")");
+    }
+  }
   {
     const pr = await probeRequiredAttributes(page).catch(() => ({ requiredCount: 0, missing: [] }));
     console.log("[上架]", stamp(), "⑤ 必填属性探测 =", JSON.stringify({ requiredCount: pr.requiredCount, missing: pr.missing }).slice(0, 240));
@@ -336,8 +355,47 @@ try {
     }
   }
 
+  // ⑤d 类目自带区块（如「颜色分类」主色+备注、「厚度」勾选/值）——通用探测后填充，不建规格类型
+  const builtin = await fillCatalogBuiltinZones(page, DIMS, [V0, V1], P.attributes || {}, CFG.builtinDecisions || {}, {
+    checkboxValue: CFG.builtinCheckboxValue || "skip",
+  }).catch((e) => ({ err: String(e.message).slice(0, 90) }));
+  console.log("[上架]", stamp(), "⑤d 自带区块 =", JSON.stringify(builtin).slice(0, 700));
+  // 探测到但无法自动匹配的自带区 → **必须先问用户**（不做静默决定）
+  if (Array.isArray(builtin.unmatched) && builtin.unmatched.length && CFG.builtinAsk !== "skip") {
+    const list = builtin.unmatched.map((z) => ({ 标签: z.label, 形态: z.shape, 占位: z.ph }));
+    console.log("[上架]", stamp(), "⑤d ⚠️ 有自带区无法自动匹配，需要用户决定：");
+    console.log("[上架]", stamp(), JSON.stringify(list, null, 1));
+    throw new Error(
+      "builtin_needs_user_decision:" +
+        JSON.stringify(list) +
+        " —— 请在 run-config.json 的 builtinDecisions 里指定映射，例如 {\"" +
+        (list[0] && list[0].标签) +
+        "\": \"颜色\"} 或 \"ignore\"；确认后再跑",
+    );
+  }
+
   // ⑥ 规格表
-  const spec = await stepRetry("⑥ 规格表", () => ensureSpecTable(page, DIMS, [V0, V1]).then((r) => { if (!r || !r.ok) throw new Error("spec_table_not_ok:" + JSON.stringify(r && r.reason || "")); return r; }));
+  // 维度名对齐页面规格类型名：Excel 常写「颜色分类/尺寸分类」，页面下拉只有「颜色/尺寸」
+const DIM_PAGE = DIMS.map((d) => String(d || "").replace(/分类$/, "").trim());
+// 用 ⑤d 的**实时探测结果**决定哪些维度由类目自带区承载（不再写死 placeholder）
+const BUILTIN_FILLED = (builtin && builtin.filled) || {};
+const BUILTIN_LABELS = Object.values(BUILTIN_FILLED).map((x) => (x && x.label) || "").filter(Boolean);
+const coveredByBuiltin = (dim) => {
+  const base = String(dim).replace(/分类$/, "").replace(/\s+/g, "");
+  return BUILTIN_LABELS.some((lab) => String(lab).includes(base) || base.includes(String(lab)));
+};
+const SPEC_IDX = [];
+for (let i = 0; i < DIM_PAGE.length; i++) {
+  const d = DIM_PAGE[i];
+  if (coveredByBuiltin(d)) continue;               // 已由自带区承载 → 不建规格类型
+  if (i === 0 && DIM_PAGE.length === 1) continue;  // 保底：至少留一个类型
+  SPEC_IDX.push(i);
+}
+const SPEC_DIMS = SPEC_IDX.map((i) => DIM_PAGE[i]);
+const SPEC_VALS = SPEC_IDX.map((i) => [V0, V1][i] || []);
+const SPEC_EXPECT = (V0 || []).length * (V1 || []).length;
+console.log("[上架]", stamp(), "⑥ 规格维度 =", JSON.stringify({ page: DIM_PAGE, build: SPEC_DIMS, expectRows: SPEC_EXPECT }));
+const spec = await stepRetry("⑥ 规格表", () => ensureSpecTable(page, SPEC_DIMS, SPEC_VALS, { expectRows: SPEC_EXPECT }).then((r) => { if (!r || !r.ok) throw new Error("spec_table_not_ok:" + JSON.stringify(r && r.reason || "")); return r; }));
   console.log("[上架]", stamp(), "⑥ 规格表 ok =", spec.ok, "| matrix =", JSON.stringify(spec.matrix), "| rounds =", spec.rounds);
       await shot("⑥ 规格表");
   if (!spec.ok) throw new Error("spec_table_failed");
@@ -372,6 +430,12 @@ try {
   console.log("[上架]", stamp(), "⑧b 正向核验 =", JSON.stringify({ total: cp.total, withImg: cp.withImg, missing: cp.missing.length, sample: cp.missing.slice(0, 3) }));
 
   // ⑨ 参考价
+  // ⑨c 满件折扣（默认 9.9 折；可配 fullDiscount / fullDiscountPieces）
+  const FD = CFG.fullDiscount === false ? null : Number(CFG.fullDiscount || 9.9);
+  if (FD) {
+    const fd = await fillFullDiscount(page, FD, { pieces: Number(CFG.fullDiscountPieces || 2) }).catch((e) => ({ ok: false, err: String(e.message).slice(0, 80) }));
+    console.log("[上架]", stamp(), "⑨c 满件折扣 =", JSON.stringify(fd));
+  }
   const rp = await setRefPrice(page, P.ref_price);
   console.log("[上架]", stamp(), "⑨ 参考价 =", JSON.stringify(rp));
   await shot("⑨ 参考价");
@@ -379,11 +443,17 @@ try {
   // ⑨b 详情区复核/补传
   let z = await readDetailZone(page);
   console.log("[上架]", stamp(), "⑨b 详情区 =", `计数器 ${z.counter} / 容器 ${z.containers} / 期望 ${D.detail_images.length}`);
-  if ((z.counter || 0) < D.detail_images.length) {
-    const re = await uploadZoneFast(page, "商品详情", 50, D.detail_images, { timeoutMs: 300000, waitMs: 180000 });
-    console.log("[上架]", stamp(), "⑨b 补传 =", JSON.stringify(re));
+  // 判据用「真图数」而不是计数器：计数器会把「上传失败」占位也算进 N/50（实测显示 14/50 但只有 13 张真图）
+  if ((z.realImgs || 0) < D.detail_images.length || (z.failed || 0) > 0) {
+    console.log(
+      "[上架]", stamp(),
+      "⑨b ⚠️ 详情区不齐（realImgs " + (z.realImgs || 0) + "/" + D.detail_images.length + "，failed " + (z.failed || 0) + "）→ 清空重传以保证顺序",
+    );
+    await cleanExtraDetails(page, 0).catch((e) => ({ err: String(e.message).slice(0, 60) }));
+    const re = await uploadZoneFast(page, "商品详情", 50, D.detail_images, { timeoutMs: 420000, waitMs: 240000, detailMode: "strict" });
+    console.log("[上架]", stamp(), "⑨b 重传 =", JSON.stringify(re).slice(0, 200));
     z = await readDetailZone(page);
-    console.log("[上架]", stamp(), "⑨b 复核后 =", `计数器 ${z.counter} / 容器 ${z.containers}`);
+    console.log("[上架]", stamp(), "⑨b 复核后 =", `计数器 ${z.counter} / 容器 ${z.containers} / 真图 ${z.realImgs}`);
   }
   // 多出来的图：逐张删残留（插件 ⑨b 下半段）
   if (z.containers > D.detail_images.length) {

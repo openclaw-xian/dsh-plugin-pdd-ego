@@ -17,6 +17,7 @@ xlsx_to_product.py —— 素材包一键生成 product.json（read_excel + buil
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -47,6 +48,66 @@ def find_dir(root, *needles):
                 if n in d:
                     return os.path.join(dirpath, d)
     return None
+
+
+
+def read_excel_attrs(xlsx_path):
+    """从素材包 Excel 直接读类目属性（表头行 + 元数据行 + 产品行）。
+
+    read_excel.py 只输出标题/品牌/价格/类目/图片/SKU，不含产品属性；
+    这里按 Excel 的列元数据把属性列取出来（多值按 ,，、/;； 拆分）。
+    """
+    try:
+        from openpyxl import load_workbook
+    except Exception:
+        return {}
+    try:
+        wb = load_workbook(xlsx_path, data_only=True)
+    except Exception:
+        return {}
+    ws = wb['拼多多'] if '拼多多' in wb.sheetnames else wb[wb.sheetnames[0]]
+    header_row = None
+    for r in range(1, min(ws.max_row, 20) + 1):
+        vals = [str(ws.cell(row=r, column=c).value or '') for c in range(1, ws.max_column + 1)]
+        if any('商品标题' in v for v in vals):
+            header_row = r
+            break
+    if header_row is None:
+        return {}
+    meta_row, data_row = header_row + 1, header_row + 2
+    SKIP_WORDS = ['预览图', '库存', '拼单价', '单买价', '规格编码', '商品规格', '轮播图',
+                  '商品详情', '参考价', '商品标识', '编码']
+    SPECIAL = {'composition': '成分含量', 'origin': '产地', 'shape': '形状'}
+    attrs = {}
+    for c in range(1, ws.max_column + 1):
+        raw_h = str(ws.cell(row=header_row, column=c).value or '').strip()
+        if not raw_h:
+            continue
+        h = raw_h.replace('★', '').strip()
+        if any(w in h for w in SKIP_WORDS):
+            continue
+        meta = {}
+        m = ws.cell(row=meta_row, column=c).value
+        if isinstance(m, str) and m.strip().startswith('{'):
+            try:
+                meta = json.loads(m)
+            except Exception:
+                meta = {}
+        key = str(meta.get('key') or '')
+        if key.startswith('__'):
+            continue                      # 商品标识 / __skuSpecType*
+        if meta.get('parentKey'):
+            continue                      # SKU 维度列
+        if key in ('mainImages', 'title', 'brand'):
+            continue
+        name = SPECIAL.get(key, h)
+        v = ws.cell(row=data_row, column=c).value
+        if v is None or not str(v).strip():
+            continue                      # 空值不写（交给必填探测暴露）
+        parts = [p.strip() for p in re.split(r'[,，、/;；]', str(v).strip()) if p.strip()]
+        if parts:
+            attrs[name] = parts
+    return attrs
 
 
 def main():
@@ -107,7 +168,7 @@ def main():
         })
 
     # 默认直接按 Excel 的产品属性列取（不依赖参考包）；--attrs-from 只用于覆盖同名项
-    attrs = d.get('attributes') or {}
+    attrs = d.get('attributes') or read_excel_attrs(xlsx)
     if a.attrs_from and os.path.isfile(a.attrs_from):
         ref = json.load(open(a.attrs_from, encoding='utf-8-sig'))
         ref_attrs = (ref.get('product') or {}).get('attributes') or {}
