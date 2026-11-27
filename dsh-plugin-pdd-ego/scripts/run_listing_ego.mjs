@@ -300,7 +300,14 @@ const dz = await uploadZoneFast(page, "商品详情", 50, D.detail_images, { tim
   }
 
   // ⑤ 品牌 + 属性
-  const br = await fillBrand(page, P.brand);
+  // ★ 品牌偶发选不上（实测某店铺有一次变成「无品牌/无注册商标」）→ 最多 3 次重试
+  let br = { ok: false, value: null };
+  for (let bi = 1; bi <= 3; bi++) {
+    br = await fillBrand(page, P.brand).catch((e) => ({ ok: false, err: String(e.message).slice(0, 60) }));
+    if (br && br.ok && String(br.value || "") === String(P.brand)) break;
+    console.log("[上架]", stamp(), "⑤ 品牌尝试 " + bi + " 未达成（" + String((br && br.value) || "") + "）→ 重试");
+    await sleep(900);
+  }
   console.log("[上架]", stamp(), "⑤ 品牌 =", JSON.stringify(br));
 
   const DIRECT = new Set(["厚度", "平方克重", "重量"]);
@@ -444,16 +451,12 @@ const spec = await stepRetry("⑥ 规格表", () => ensureSpecTable(page, SPEC_D
   let z = await readDetailZone(page);
   console.log("[上架]", stamp(), "⑨b 详情区 =", `计数器 ${z.counter} / 容器 ${z.containers} / 期望 ${D.detail_images.length}`);
   // 判据用「真图数」而不是计数器：计数器会把「上传失败」占位也算进 N/50（实测显示 14/50 但只有 13 张真图）
+  // 按用户口径：**不做兜底重传**（详情图批量提交后只看复核结果，不自动清空重传）
   if ((z.realImgs || 0) < D.detail_images.length || (z.failed || 0) > 0) {
     console.log(
       "[上架]", stamp(),
-      "⑨b ⚠️ 详情区不齐（realImgs " + (z.realImgs || 0) + "/" + D.detail_images.length + "，failed " + (z.failed || 0) + "）→ 清空重传以保证顺序",
+      "⑨b ⚠️ 详情区不齐（真图 " + (z.realImgs || 0) + "/" + D.detail_images.length + "，失败标记 " + (z.failed || 0) + "）—— 已关闭自动兜底，请人工确认",
     );
-    await cleanExtraDetails(page, 0).catch((e) => ({ err: String(e.message).slice(0, 60) }));
-    const re = await uploadZoneFast(page, "商品详情", 50, D.detail_images, { timeoutMs: 420000, waitMs: 240000, detailMode: "strict" });
-    console.log("[上架]", stamp(), "⑨b 重传 =", JSON.stringify(re).slice(0, 200));
-    z = await readDetailZone(page);
-    console.log("[上架]", stamp(), "⑨b 复核后 =", `计数器 ${z.counter} / 容器 ${z.containers} / 真图 ${z.realImgs}`);
   }
   // 多出来的图：逐张删残留（插件 ⑨b 下半段）
   if (z.containers > D.detail_images.length) {

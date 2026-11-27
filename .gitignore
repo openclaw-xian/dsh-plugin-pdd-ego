@@ -2,3 +2,6 @@
 *.bak*
 
 _apitemp/
+
+__pycache__/
+*.pyc

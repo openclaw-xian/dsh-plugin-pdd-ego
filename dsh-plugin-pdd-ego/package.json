@@ -1,6 +1,6 @@
 {
   "name": "dsh-plugin-pdd-ego",
-  "version": "1.1.9",
+  "version": "1.1.10",
   "private": true,
   "description": "NovaFlow 内置插件：ego 版拼多多多店铺上架（技能 pdd-ego-listing + pdd_ego_* 工具）。执行层随包放在 scripts/，路径自动探测；只填空与 34 项校验，默认不存草稿、不提交。",
   "license": "MIT",

@@ -489,6 +489,24 @@ export async function uploadMainImages(page, files, { capacity = 10, timeoutMs =
     const st2 = await mainImagesState(page).catch(() => null);
     if (st2 && st2.uploaded >= n) return { ok: true, how: "old_page_index_" + idx, uploaded: st2.uploaded, total: st2.total };
   }
+  // ★ 用户口径：主图失败**直接整批重来，不做删除**（详情图例外，才需要删那一张重传）
+  {
+    const want = files.slice(0, n);
+    log("② 主图未齐 → 整批重传一次（不删除任何已传图）");
+    await page.setInputFiles(sel, want).catch(() => {});
+    await waitUntil(
+      async () => {
+        const c = await readImageCounters(page).catch(() => []);
+        const up = (c.find((x) => x.total === capacity) || c[0] || {}).up || 0;
+        return up >= n ? up : null;
+      },
+      { timeoutMs: 90000, intervalMs: 600, label: "main-batch-retry" },
+    ).catch(() => {});
+    const c2 = await readImageCounters(page).catch(() => []);
+    const up2 = (c2.find((x) => x.total === capacity) || c2[0] || {}).up || 0;
+    if (up2 >= n) return { ok: true, how: "batch_retry_no_delete", uploaded: up2, want: n };
+  }
+
   return { ok: false, reason: "main_upload_failed", state: await mainImagesState(page).catch(() => null) };
 }
 
@@ -592,52 +610,78 @@ export async function uploadZoneFast(page, zoneName, capacity, files, { timeoutM
     const failedImgs = [];
     let okCount = 0;
     let retries = 0;
+    const orderLog = [];   // {file, pos} —— 用于核对「文件→格子」是否错位
+    // 读「第 i 格」的状态：has_img（真图）/ no_img（占位）/ no_cell（还没这格）
+    const cellState = (i) =>
+      page
+        .evaluate((idx) => {
+          const vis = (e) => !!(e && e.offsetParent);
+          const cs = [...document.querySelectorAll("[class*=ImageWithRemark_v2_imageContainer]")].filter(vis);
+          const n = cs[idx];
+          if (!n) return "no_cell";
+          const im = n.querySelector("img");
+          return im && /pfs\.pinduoduo\.com/i.test(im.getAttribute("src") || "") ? "has_img" : "no_img";
+        }, i)
+        .catch(() => "no_cell");
+
     for (const f of list) {
       let done = false;
-      for (let att = 1; att <= 3 && !done; att++) {
+      for (let att = 1; att <= 6 && !done; att++) {
         const z0 = await readDetailZone(page).catch(() => null);
         const baseCnt = z0 ? z0.containers || 0 : 0;
         await page.setInputFiles(sel, [f]).catch(() => {});
-        const deadline = Date.now() + 26000;
+
+        // ① 等待：只认 baseCnt 这一格出现真图（不看「最后一个格子」，那会读到上一张的图）
+        const deadline = Date.now() + 40000;
         let okNow = false;
         while (Date.now() < deadline) {
           await sleep(350);
           const z = await readDetailZone(page).catch(() => null);
           if (!z || (z.containers || 0) <= baseCnt) continue;
-          const realNow = await page
-            .evaluate((i) => {
-              const vis = (e) => !!(e && e.offsetParent);
-              const cs = [...document.querySelectorAll("[class*=ImageWithRemark_v2_imageContainer]")].filter(vis);
-              const n = cs[i];
-              if (!n) return false;
-              const im = n.querySelector("img");
-              return !!(im && /pfs\.pinduoduo\.com/i.test(im.getAttribute("src") || ""));
-            }, (z.containers || 1) - 1)
-            .catch(() => false);
-          if (realNow) {
+          if ((await cellState(baseCnt)) === "has_img") {
             okNow = true;
             break;
           }
         }
+
         if (okNow) {
           done = true;
           okCount += 1;
+          orderLog.push({ file: String(f).split("/").pop(), pos: baseCnt + 1 });
         } else {
-          // 失败：删掉刚产生的占位，再重试同一张（此时后续图还没传，顺序不会错）
           retries += 1;
-          const z2 = await readDetailZone(page).catch(() => null);
-          // ★ 只有「确实新增了容器」时才删，且只删 baseCnt 这一格；
-          //   容器没增加（上传没生效/延迟）时**什么都不要删**——否则会删掉上一张已成功的图
-          if (z2 && (z2.containers || 0) > baseCnt) {
-            await deleteDetailAt(page, baseCnt).catch(() => null);
-            await waitUntil(async () => {
+          // ② 失败处理：那一格有占位就删掉它再重传；连格子都没有就什么都不删
+          const st2 = await cellState(baseCnt);
+          if (st2 === "no_img") {
+            // 删「本次这一格」并**确认删净**（容器数回到 baseCnt）；删不净就停，绝不继续传下一张造成累积
+            let settled = false;
+            for (let dk = 0; dk < 3 && !settled; dk++) {
+              await deleteDetailAt(page, baseCnt).catch(() => null);
+              await sleep(900);
               const z3 = await readDetailZone(page).catch(() => null);
-              return z3 && (z3.containers || 0) <= baseCnt ? z3 : null;
-            }, { timeoutMs: 8000, intervalMs: 300, label: "detail-delete-settled" });
+              if ((z3 && (z3.containers || 0)) <= baseCnt) settled = true;
+            }
+            if (!settled) {
+              throw new Error("detail_delete_failed: 第 " + (baseCnt + 1) + " 格占位删不掉（容器数没降下来）");
+            }
           }
+          // 再兜一层：容器数不能超过「已成功数 + 本次这一格」
+          const zNow = await readDetailZone(page).catch(() => null);
+          if (zNow && (zNow.containers || 0) > baseCnt + 1) {
+            throw new Error(
+              "detail_container_overflow: 容器 " + zNow.containers + " > 预期 " + (baseCnt + 1) + "（第 " + (baseCnt + 1) + " 格）",
+            );
+          }
+          await sleep(600);
         }
       }
-      if (!done) failedImgs.push(String(f).split("/").pop());
+      if (!done) {
+        // ★ 一张不落地就**绝不往下传**：否则下一张会顶掉这一格的占位，导致「12 被 13 覆盖」
+        failedImgs.push(String(f).split("/").pop());
+        throw new Error(
+          "detail_upload_failed:" + String(f).split("/").pop() + "（该张 6 次重试仍无真图，已停止整批上传）",
+        );
+      }
     }
     const fin = await readDetailZone(page).catch(() => null);
     return {
@@ -652,21 +696,24 @@ export async function uploadZoneFast(page, zoneName, capacity, files, { timeoutM
       containers: fin ? fin.containers : null,
       zone: zoneName,
       how: "detail_strict",
+      orderLog,
     };
   }
 
   // ── 详情区：批量上传（detailMode="batch"）；快，但失败不会自动重传，只用 realImgs 兜底判定 ──
   if (isDetail && detailMode === "batch") {
     await page.setInputFiles(sel, list).catch(() => {});
+    // ★ 判据：容器数到齐 **且真图数到齐**（只等容器数会在图片转码期间误报 realImgs=0）
     await waitUntil(
       async () => {
         const z = await readDetailZone(page).catch(() => null);
         if (!z || (z.containers || 0) < want) return null;
+        if ((z.realImgs || 0) < want) return null;
         return z;
       },
       { timeoutMs: Math.round(timeoutMs * 0.6), intervalMs: 600, label: "detail-batch" },
-    );
-    await sleep(3500);
+    ).catch(() => null);
+    await sleep(1500);
     const fin = await readDetailZone(page).catch(() => null);
     const real = fin ? fin.realImgs || 0 : 0;
     return {
@@ -1974,10 +2021,9 @@ export async function robustCommitSpecValue(page, group, value) {
     await sleep(120);
   }
   await page.keyboard.insertText(String(value));
-  await sleep(250);
-  // 提交：先 Enter（部分类目回车即落值并自动新增空槽），没落值再 Tab 兜底
+  await sleep(120);
+  // 提交：先 Enter（部分类目回车即落值并自动新增空槽），再**检测式**等待落值（出现即继续，不再固定等）
   await page.keyboard.press("Enter");
-  await sleep(800);
   const landed = await page.evaluate((v) => {
     const isValueInput = (e) => {
       const ph = e.placeholder || "";
@@ -1986,6 +2032,8 @@ export async function robustCommitSpecValue(page, group, value) {
     };
     return [...document.querySelectorAll("input")].some((e) => e.offsetParent && isValueInput(e) && (e.value || "").trim() === v);
   }, String(value));
+  // 检测式等待：最多 12 次 × 150ms，出现就立刻进入下一张
+  if (!landed) await sleep(150);
   if (!landed) {
     await page.keyboard.press("Tab");
     await sleep(500);
@@ -2021,7 +2069,7 @@ export async function fillCatalogBuiltinZones(page, dimNames, dimValues, attribu
     材质: ["材质", "面料"],
     克重: ["克重", "平方克重", "重量", "毯重"],
   };
-  const NOISE = /商品规格|请依据|请选择|请输入|添加规格|删除|排序|上传|展开|收起|自定义|全部|批量|搜索/;
+  const NOISE = /商品规格|请依据|请选择|请输入|添加|定制规格|删除|排序|上传|展开|收起|自定义|全部|批量|搜索/;
 
   // ① 探测
   const scan = await page
@@ -2038,7 +2086,7 @@ export async function fillCatalogBuiltinZones(page, dimNames, dimValues, attribu
         if (block && block.querySelectorAll("input").length >= 1) break;
       }
       if (!block) return { ok: false, zones: [] };
-      const SKIP = /商品规格|请依据|请选择|请输入|添加规格|删除|排序|上传|展开|收起|自定义|全部|批量|搜索|规格类型/;
+      const SKIP = /商品规格|请依据|请选择|请输入|添加|定制规格|删除|排序|上传|展开|收起|自定义|全部|批量|搜索|规格类型|本地上传|图片空间/;
       const zones = [];
       const seen = new Set();
       const labels = [...block.querySelectorAll("*")].filter((e) => {

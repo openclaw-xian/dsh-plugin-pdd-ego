@@ -202,3 +202,16 @@ pdd_ego_xlsx_to_product({ assets: "<包目录>" })
 - 不新建运费模板、不改价、不上下架、不碰订单客服投流
 - 不代替用户点「提交并上架」；提交必须 `allowSubmit` 与 `submitAfterPass` 双开
 - 失败就停：`freight_template_failed` / `category_mismatch_on_form` / `spec_table_failed` 都要人工介入，不要绕过
+
+## 上架后落账（必须）
+
+新链接上架成功后，用新生成的商品 ID 落账：
+
+```bash
+node record-listing.mjs --shop <店铺> --goods-id <新商品ID> --goods-name "<商品名>" --status 审核中 --evidence <报告/截图>
+```
+
+- 新链接：`action=listing-new`，`before=未上架`，`after=审核中/在售`
+- 已下架商品重新上架：`action=relist`，`before=已下架`
+- 不适用 `product_delisted` 拦截；新链接上架前没有 goodsId
+- 落账路径：`店铺运营日志/商品/<店铺>/<商品ID>/`
