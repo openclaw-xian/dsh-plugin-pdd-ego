@@ -8,7 +8,7 @@
   "submitAfterPass": false,
   "allowSubmit": false,
   "shot": false,
-  "detailMode": "strict",
+  "detailMode": "batch",
   "builtinDecisions": {},
   "builtinAsk": "",
   "video": ""

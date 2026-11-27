@@ -553,7 +553,7 @@ export async function fillTitle(page, title) {
 }
 
 /** 图区上传（逐张 + 逐张核对计数） */
-export async function uploadZoneFast(page, zoneName, capacity, files, { timeoutMs = 300000, waitMs = 60000, detailMode = "strict" } = {}) {
+export async function uploadZoneFast(page, zoneName, capacity, files, { timeoutMs = 300000, waitMs = 60000, detailMode = "batch" } = {}) {
   const marker = "ego-zone-" + Date.now();
   const sel = await page.evaluate(
     ({ zone, mkv }) => {
@@ -2086,9 +2086,10 @@ export async function fillCatalogBuiltinZones(page, dimNames, dimValues, attribu
         if (block && block.querySelectorAll("input").length >= 1) break;
       }
       if (!block) return { ok: false, zones: [] };
-      const SKIP = /商品规格|请依据|请选择|请输入|添加|定制规格|删除|排序|上传|展开|收起|自定义|全部|批量|搜索|规格类型|本地上传|图片空间/;
+      const SKIP = /商品规格|请依据|请选择|请输入|添加|定制规格|删除|排序|上移|下移|左移|右移|置顶|上传|展开|收起|自定义|全部|批量|搜索|规格类型|本地上传|图片空间/;
       const zones = [];
       const seen = new Set();
+      const ignored = [];
       const labels = [...block.querySelectorAll("*")].filter((e) => {
         if (!vis(e) || e.children.length) return false;
         const t = n(e.textContent);
@@ -2115,14 +2116,21 @@ export async function fillCatalogBuiltinZones(page, dimNames, dimValues, attribu
           break;
         }
         if (!hit) continue;
+        // ★ 占位符全是「规格类型1/2…」的是**规格类型输入位**（用户填维度名的地方），不是维度值区
+        const phAll = hit.placeholders || [];
+        if (phAll.length && phAll.every((p) => /规格类型\s*/i.test(String(p || "")))) {
+          ignored.push({ label: name, reason: "spec_type_input", ph: phAll.slice(0, 2) });
+          continue;
+        }
         seen.add(name);
         zones.push({ label: name, ...hit });
       }
-      return { ok: true, zones };
+      return { ok: true, zones, ignored };
     })
     .catch(() => ({ ok: false, zones: [] }));
 
   const ZONES = Array.isArray(scan.zones) ? scan.zones : [];
+  const IGNORED = Array.isArray(scan.ignored) ? scan.ignored : [];
   const findZone = (dim) => {
     const base = String(dim).replace(/分类$/, "").replace(/\s+/g, "");
     const cands = SYN[base] || [String(dim)];
@@ -2135,6 +2143,7 @@ export async function fillCatalogBuiltinZones(page, dimNames, dimValues, attribu
 
   const out = {
     probe: ZONES.map((z) => ({ label: z.label, shape: z.checkbox > 0 ? "checkbox+" + (z.text > 0 ? "number" : "none") : z.text > 1 ? "text-pair" : "text", ph: z.placeholders })),
+    ignored: IGNORED.map((x) => x.label + "(" + x.reason + ")"),
     filled: {},
     skipped: [],
     unmatched: [],

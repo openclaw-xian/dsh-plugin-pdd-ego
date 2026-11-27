@@ -252,7 +252,7 @@ try {
   await dismissOverlays(page);
 
   // ④ 详情图
-  const DETAIL_MODE = String(CFG.detailMode || "strict").toLowerCase() === "batch" ? "batch" : "strict";
+  const DETAIL_MODE = String(CFG.detailMode || "batch").toLowerCase() === "strict" ? "strict" : "batch";
 const dz = await uploadZoneFast(page, "商品详情", 50, D.detail_images, { timeoutMs: 420000, waitMs: 240000, detailMode: DETAIL_MODE });
   console.log("[上架]", stamp(), "④ 详情图 =", JSON.stringify(dz));
   if (dz && dz.failedCount > 0) {
@@ -300,7 +300,7 @@ const dz = await uploadZoneFast(page, "商品详情", 50, D.detail_images, { tim
   }
 
   // ⑤ 品牌 + 属性
-  // ★ 品牌偶发选不上（实测某店铺有一次变成「无品牌/无注册商标」）→ 最多 3 次重试
+  // ★ 品牌偶发选不上（实测 店铺C 有一次变成「无品牌/无注册商标」）→ 最多 3 次重试
   let br = { ok: false, value: null };
   for (let bi = 1; bi <= 3; bi++) {
     br = await fillBrand(page, P.brand).catch((e) => ({ ok: false, err: String(e.message).slice(0, 60) }));
@@ -386,7 +386,10 @@ const dz = await uploadZoneFast(page, "商品详情", 50, D.detail_images, { tim
 const DIM_PAGE = DIMS.map((d) => String(d || "").replace(/分类$/, "").trim());
 // 用 ⑤d 的**实时探测结果**决定哪些维度由类目自带区承载（不再写死 placeholder）
 const BUILTIN_FILLED = (builtin && builtin.filled) || {};
-const BUILTIN_LABELS = Object.values(BUILTIN_FILLED).map((x) => (x && x.label) || "").filter(Boolean);
+const BUILTIN_LABELS = Object.values(BUILTIN_FILLED)
+  .filter((x) => x && Array.isArray(x.filled) && x.filled.length > 0)   // ★ 没填进去就不算覆盖
+  .map((x) => (x && x.label) || "")
+  .filter(Boolean);
 const coveredByBuiltin = (dim) => {
   const base = String(dim).replace(/分类$/, "").replace(/\s+/g, "");
   return BUILTIN_LABELS.some((lab) => String(lab).includes(base) || base.includes(String(lab)));
