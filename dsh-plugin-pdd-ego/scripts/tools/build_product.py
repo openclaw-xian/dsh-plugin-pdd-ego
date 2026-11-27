@@ -4,7 +4,7 @@
 从「素材目录 + 一份 listing.json」生成 pdd_flow 可直接吃的 product.json（含 ASCII 素材副本）。
 
 用法：
-  python build_product.py --listing listing.json --assets "D:/图片/PE6_木纹替换完成" --out ./work
+  python build_product.py --listing listing.json --assets "<图片目录>/素材包" --out ./work
 
 listing.json 结构（示例见 listing.example.json）：
 {

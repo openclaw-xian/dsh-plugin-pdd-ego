@@ -1,6 +1,6 @@
 ﻿# install.ps1 —— 一键安装 dsh-plugin-pdd-ego（装完需重启 DeepSeek Harness）
 # 做三件事：
-#   1) 复制插件包到 D:/plugins\dsh-plugin-pdd-ego 与 profile 的 node_modules
+#   1) 复制插件包到 $pluginLib 与 profile 的 node_modules
 #   2) profile package.json：加 file: 依赖 + dsh.profile.bundles 条目
 #   3) profile cordis.patch.yml：加 insert 条目（兜底）+ config 覆盖
 $ErrorActionPreference = 'Stop'
@@ -27,7 +27,7 @@ function Assert-NoBom([string]$path) {
 $src = Split-Path -Parent $MyInvocation.MyCommand.Path
 $dshHome = Join-Path $env:USERPROFILE '.dsh'
 $profile = Join-Path $dshHome 'profiles\desktop'
-$pluginLib = 'D:/plugins\dsh-plugin-pdd-ego'
+$pluginLib = if ($env:PDD_PLUGIN_DIR) { $env:PDD_PLUGIN_DIR } else { $PSScriptRoot }
 $nmDst = Join-Path $profile 'node_modules\dsh-plugin-pdd-ego'
 
 if (-not (Test-Path $profile)) { throw "找不到 DSH profile：$profile" }
@@ -56,7 +56,7 @@ Copy-Item $pkgPath "$pkgPath.bak-ego-$stamp" -Force
 Assert-NoBom $pkgPath | Out-Null
 $pkg = [System.IO.File]::ReadAllText($pkgPath) | ConvertFrom-Json
 if (-not $pkg.dependencies) { $pkg | Add-Member -NotePropertyName dependencies -NotePropertyValue ([pscustomobject]@{}) -Force }
-$pkg.dependencies | Add-Member -NotePropertyName 'dsh-plugin-pdd-ego' -NotePropertyValue 'file:D:/plugins/dsh-plugin-pdd-ego' -Force
+$pkg.dependencies | Add-Member -NotePropertyName 'dsh-plugin-pdd-ego' -NotePropertyValue ("file:" + $pluginLib) -Force
 if (-not $pkg.dsh) { $pkg | Add-Member -NotePropertyName dsh -NotePropertyValue ([pscustomobject]@{}) -Force }
 if (-not $pkg.dsh.profile) { $pkg.dsh | Add-Member -NotePropertyName profile -NotePropertyValue ([pscustomobject]@{}) -Force }
 if (-not $pkg.dsh.profile.bundles) { $pkg.dsh.profile | Add-Member -NotePropertyName bundles -NotePropertyValue @() -Force }
