@@ -230,3 +230,12 @@ node record-listing.mjs --shop <店铺> --goods-id <新商品ID> --goods-name "<
 - 已下架商品重新上架：`action=relist`，`before=已下架`
 - 不适用 `product_delisted` 拦截；新链接上架前没有 goodsId
 - 落账路径：`店铺运营日志/商品/<店铺>/<商品ID>/`
+
+## 多店铺约定
+
+- 一个 `profile` 只对应一个店铺，`profile` 是唯一身份。
+- `shop` 只用于展示和账本/产物目录，不用于定位登录态。
+- 配置必须显式给 `{ shop, profile }`，不按店铺名猜 profile。
+- 登录、space、操作都按 profile 隔离。
+- profile 缺失/失效 → `shop_not_logged_in` / `login_required`，不自动映射。
+- 账本/产物路径按 shop 分：`<root>/<shop>/...`。
