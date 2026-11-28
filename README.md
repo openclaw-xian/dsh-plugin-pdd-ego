@@ -152,3 +152,7 @@ ego-browser nodejs -e "globalThis.__PDD_CFG={cmd:'spaces'}; await import('file:/
 - 不代登录、不碰验证码
 - 不做改价、改库存、下架、订单、客服、投流
 - 提交必须用户显式授权；跑完请自行在后台核对
+
+## 安装后自检
+
+重启后调用 `pdd_ego_env`，确认 ego/Python/店铺 space 三项 ok 再上架。工具表另含 `pdd_ego_env`（自检 ego/Python/店铺 space）。
